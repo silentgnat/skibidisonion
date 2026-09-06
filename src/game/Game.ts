@@ -77,7 +77,7 @@ export class Game {
     ctx.fillStyle = '#1a1a1a';
     ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
 
-    ctx.fillStyle = '#e0e0e0';
+    ctx.fillStyle = '#4a90e2';
     ctx.fillRect(this.x, this.y, 24, 24);
   }
 }
