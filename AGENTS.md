@@ -15,6 +15,10 @@ be trivially deployable (GitHub Pages, Netlify, Vercel, etc.).
 - `npm run build` — typecheck + production build to `dist/`
 - `npm run preview` — serve the production build locally
 
+Deployment: `.github/workflows/deploy.yml` builds on push to `main` and deploys
+`dist/` to GitHub Pages via the `actions/deploy-pages` flow (Pages source must be
+set to "GitHub Actions"). `dist/` is gitignored — never commit it.
+
 Always run `npm run typecheck` (or `npm run build`) after making changes.
 
 ## Project structure
