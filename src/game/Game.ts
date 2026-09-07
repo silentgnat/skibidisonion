@@ -72,13 +72,6 @@ type Splat =
       startY: number;
     };
 
-interface Stain {
-  x: number;
-  y: number;
-  size: number;
-  color: string;
-}
-
 interface WorldStain {
   x: number;
   y: number;
@@ -111,6 +104,8 @@ interface Fan {
   y: number;
   dirX: number;
   dirY: number;
+  powerLv: number;
+  reachLv: number;
 }
 
 interface Producer {
@@ -195,14 +190,21 @@ export class Game {
   private objectsOpen = false;
 
   private readonly fanSize = 30;
-  private readonly fanRange = 160;
-  private readonly fanPower = 2800;
+  private readonly fanRangeBase = 160;
+  private readonly fanRangeGrowth = 1.12;
+  private readonly fanPowerBase = 2800;
+  private readonly fanPowerGrowth = 1.5;
   private readonly fanMaxSpeed = 1300;
   private readonly fanCost = 10000;
+  private readonly fanReachUpBase = 12000;
+  private readonly fanReachUpGrowth = 1.9;
+  private readonly fanPowerUpBase = 15000;
+  private readonly fanPowerUpGrowth = 1.9;
   private readonly fans: Fan[] = [];
   private fanDrag: { x: number; y: number } | null = null;
   private draggedFan: Fan | null = null;
   private hoveredFanIndex = -1;
+  private selectedFan: Fan | null = null;
 
   private readonly producerW = 56;
   private readonly producerH = 64;
@@ -230,7 +232,6 @@ export class Game {
   private readonly particles: Particle[] = [];
   private readonly rings: Ring[] = [];
   private readonly splats: Splat[] = [];
-  private readonly stains: Stain[] = [];
   private readonly worldStains: WorldStain[] = [];
 
   private deviceScale = 1;
@@ -374,7 +375,7 @@ export class Game {
       droppers?: DropperSave[];
       bouncer?: { x: number; y: number };
       extraBouncers?: { x: number; y: number }[];
-      fans?: { x: number; y: number; dirX: number; dirY: number }[];
+      fans?: { x: number; y: number; dirX: number; dirY: number; powerLv?: number; reachLv?: number }[];
       producers?: ProducerSave[];
     };
     try {
@@ -473,7 +474,14 @@ export class Game {
           dy = sf.dirY / len;
         }
       }
-      this.fans.push({ x: pos.x, y: pos.y, dirX: dx, dirY: dy });
+    this.fans.push({
+        x: pos.x,
+        y: pos.y,
+        dirX: dx,
+        dirY: dy,
+        powerLv: typeof sf.powerLv === 'number' ? sf.powerLv : 0,
+        reachLv: typeof sf.reachLv === 'number' ? sf.reachLv : 0,
+      });
     }
   }
 
@@ -498,7 +506,7 @@ export class Game {
     droppers: DropperSave[];
     bouncer: { x: number; y: number };
     extraBouncers: { x: number; y: number }[];
-    fans: { x: number; y: number; dirX: number; dirY: number }[];
+    fans: { x: number; y: number; dirX: number; dirY: number; powerLv: number; reachLv: number }[];
     producers: ProducerSave[];
   } {
     return {
@@ -518,7 +526,7 @@ export class Game {
       })),
       bouncer: { x: this.bouncer.x, y: this.bouncer.y },
       extraBouncers: this.extraBouncers.map((b) => ({ x: b.x, y: b.y })),
-      fans: this.fans.map((f) => ({ x: f.x, y: f.y, dirX: f.dirX, dirY: f.dirY })),
+      fans: this.fans.map((f) => ({ x: f.x, y: f.y, dirX: f.dirX, dirY: f.dirY, powerLv: f.powerLv, reachLv: f.reachLv })),
       producers: this.producers.map((p) => ({ x: p.x, y: p.y, speedLv: p.speedLv, countLv: p.countLv })),
     };
   }
@@ -864,6 +872,16 @@ export class Game {
       return;
     }
 
+    const fanMenuHit = this.hitFanMenu(p.x, p.y);
+    if (fanMenuHit === 'close') {
+      this.selectedFan = null;
+      return;
+    }
+    if (fanMenuHit === 'power' || fanMenuHit === 'reach') {
+      this.tryBuyFanUpgrade(fanMenuHit);
+      return;
+    }
+
     this.drawX = w.x;
     this.drawY = w.y;
 
@@ -883,12 +901,20 @@ export class Game {
     }
 
     if (this.objectMode === 'pen') {
+      const fi = this.hitFanPoint(w.x, w.y);
+      if (fi >= 0) {
+        this.selectedFan = this.selectedFan === this.fans[fi] ? null : this.fans[fi];
+        this.selectedProducer = null;
+        return;
+      }
       const pi = this.hitProducerPoint(w.x, w.y);
       if (pi >= 0) {
         this.selectedProducer = this.selectedProducer === this.producers[pi] ? null : this.producers[pi];
+        this.selectedFan = null;
         return;
       }
       this.selectedProducer = null;
+      this.selectedFan = null;
     }
 
     if (this.objectMode === 'producer') {
@@ -1312,7 +1338,6 @@ if (settle > 0) {
           d.alive = false;
           d.respawnTimer = d.producer ? this.producerRespawnTime(d.producer) * (0.5 + Math.random() * 0.5) : 0;
           this.awardMoney(d);
-          this.addStain(b, d, deadColor);
           if (this.dragged === d) {
             this.dragged = null;
           }
@@ -1495,7 +1520,6 @@ if (settle > 0) {
     this.bloodCtx.clearRect(0, 0, this.bloodLayer.width, this.bloodLayer.height);
     this.splats.length = 0;
     this.worldStains.length = 0;
-    this.stains.length = 0;
     this.markSaveDirty();
   }
 
@@ -1510,7 +1534,6 @@ if (settle > 0) {
     this.bloodCtx.clearRect(0, 0, this.bloodLayer.width, this.bloodLayer.height);
     this.splats.length = 0;
     this.worldStains.length = 0;
-    this.stains.length = 0;
     this.particles.length = 0;
     this.rings.length = 0;
     this.shake = 0;
@@ -1523,6 +1546,7 @@ if (settle > 0) {
     this.producerDrag = null;
     this.draggedProducer = null;
     this.selectedProducer = null;
+    this.selectedFan = null;
     this.applyWorldSize();
     this.createProducer(Math.round(this.worldW / 2 - this.producerW / 2), 8);
     this.centerCamera();
@@ -1733,24 +1757,6 @@ if (settle > 0) {
       return { x: Math.cos(a), y: Math.sin(a) };
     }
     return { x: ux / len, y: uy / len };
-  }
-
-  private addStain(hitter: Body, victim: Body, color: string): void {
-    if (this.stains.length >= 20) {
-      this.stains.shift();
-    }
-    const dx = victim.x - hitter.x;
-    const dy = victim.y - hitter.y;
-    const len = Math.hypot(dx, dy) || 1;
-    const dist = 9 + Math.random() * 2;
-    const sx = (dx / len) * dist + (Math.random() - 0.5) * 6;
-    const sy = (dy / len) * dist + (Math.random() - 0.5) * 6;
-    this.stains.push({
-      x: Math.max(-11, Math.min(11, sx)),
-      y: Math.max(-11, Math.min(11, sy)),
-      size: 2 + Math.random() * 4.5,
-      color,
-    });
   }
 
   private addWorldStain(x: number, y: number, size: number, color: string, alpha: number): void {
@@ -2112,6 +2118,29 @@ private hslToHex(h: number, s: number, l: number): string {
     }
   }
 
+  private renderBouncerBody(b: Body, isMain: boolean): void {
+    const { ctx } = this;
+    const s = this.blockSize;
+    const cx = b.x + s / 2;
+    const cy = b.y + s / 2;
+    const r = s / 2;
+    const base = isMain ? '#4a90e2' : '#63b3ed';
+    const pulse = (Math.sin(this.time * 5 + (isMain ? 0 : 1.7)) + 1) / 2;
+    ctx.strokeStyle = base;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r + 3 + pulse * 6, 0, Math.PI * 2);
+    ctx.stroke();
+    const grad = ctx.createRadialGradient(cx - r * 0.35, cy - r * 0.35, r * 0.15, cx, cy, r);
+    grad.addColorStop(0, '#b8dcff');
+    grad.addColorStop(0.55, base);
+    grad.addColorStop(1, '#123f6b');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
   private renderSplats(): void {
     const { ctx } = this;
     const life = this.splatLifetime();
@@ -2350,7 +2379,7 @@ private hslToHex(h: number, s: number, l: number): string {
       dx /= len;
       dy /= len;
     }
-    this.fans.push({ x: pos.x, y: pos.y, dirX: dx, dirY: dy });
+    this.fans.push({ x: pos.x, y: pos.y, dirX: dx, dirY: dy, powerLv: 0, reachLv: 0 });
     this.money -= this.fanCost;
     this.sfx.buy();
     this.markSaveDirty();
@@ -2368,6 +2397,12 @@ private hslToHex(h: number, s: number, l: number): string {
     for (let i = this.fans.length - 1; i >= 0; i--) {
       const f = this.fans[i];
       if (x >= f.x - r && x <= f.x + s + r && y >= f.y - r && y <= f.y + s + r) {
+        if (this.selectedFan === f) {
+          this.selectedFan = null;
+        }
+        if (this.draggedFan === f) {
+          this.draggedFan = null;
+        }
         this.fans.splice(i, 1);
         removed = true;
       }
@@ -2534,6 +2569,75 @@ private hslToHex(h: number, s: number, l: number): string {
     return null;
   }
 
+  private fanRangeOf(f: Fan): number {
+    return this.fanRangeBase * Math.pow(this.fanRangeGrowth, f.reachLv);
+  }
+
+  private fanPowerOf(f: Fan): number {
+    return this.fanPowerBase * Math.pow(this.fanPowerGrowth, f.powerLv);
+  }
+
+  private fanReachCost(f: Fan): number {
+    return Math.round(this.fanReachUpBase * Math.pow(this.fanReachUpGrowth, f.reachLv));
+  }
+
+  private fanPowerCost(f: Fan): number {
+    return Math.round(this.fanPowerUpBase * Math.pow(this.fanPowerUpGrowth, f.powerLv));
+  }
+
+  private tryBuyFanUpgrade(kind: 'power' | 'reach'): void {
+    const f = this.selectedFan;
+    if (!f) return;
+    const cost = kind === 'power' ? this.fanPowerCost(f) : this.fanReachCost(f);
+    if (this.money < cost) {
+      this.sfx.deny();
+      return;
+    }
+    this.money -= cost;
+    if (kind === 'power') {
+      f.powerLv++;
+    } else {
+      f.reachLv++;
+    }
+    this.sfx.buy();
+    this.markSaveDirty();
+  }
+
+  private fanMenuGeom(): { x: number; y: number; w: number; rowH: number; pad: number; header: number } {
+    const rowH = 42;
+    const pad = 10;
+    const header = 26;
+    return {
+      x: Math.round(this.canvas.width / 2 - 170),
+      y: this.canvas.height - (header + 2 * (rowH + 8) + pad) - 12,
+      w: 340,
+      rowH,
+      pad,
+      header,
+    };
+  }
+
+  private hitFanMenu(px: number, py: number): 'power' | 'reach' | 'close' | null {
+    const f = this.selectedFan;
+    if (!f) return null;
+    const g = this.fanMenuGeom();
+    const panelH = g.header + 2 * (g.rowH + 8) + g.pad;
+    if (px < g.x || px > g.x + g.w || py < g.y || py > g.y + panelH) return null;
+    const closeX = g.x + g.w - g.pad - 26;
+    const closeY = g.y + g.pad - 2;
+    if (px >= closeX && px <= closeX + 26 && py >= closeY && py <= closeY + 20) return 'close';
+    const rowsTop = g.y + g.header;
+    for (let i = 0; i < 2; i++) {
+      const ry = rowsTop + i * (g.rowH + 8);
+      const bx = g.x + g.w - g.pad - 120;
+      const by = ry + (g.rowH - 26) / 2;
+      if (px >= bx && px <= bx + 120 && py >= by && py <= by + 26) {
+        return i === 0 ? 'power' : 'reach';
+      }
+    }
+    return null;
+  }
+
   private updateFans(dt: number): void {
     if (this.fans.length === 0 || this.droppers.length === 0) return;
     const s = this.fanSize;
@@ -2544,19 +2648,20 @@ private hslToHex(h: number, s: number, l: number): string {
       for (const f of this.fans) {
         const fcx = f.x + s / 2;
         const fcy = f.y + s / 2;
+        const range = this.fanRangeOf(f);
         const ox = dcx - fcx;
         const oy = dcy - fcy;
         const dist = Math.hypot(ox, oy);
-        if (dist > this.fanRange) continue;
+        if (dist > range) continue;
         const t = ox * f.dirX + oy * f.dirY;
-        if (t < 0 || t > this.fanRange) continue;
+        if (t < 0 || t > range) continue;
         const side = Math.abs(ox * f.dirY - oy * f.dirX);
         const halfW = s * 0.55 + t * 0.55;
         if (side > halfW) continue;
         if (this.lineBlocked(fcx, fcy, dcx, dcy)) continue;
-        const fall = (1 - t / this.fanRange) * (1 - Math.min(1, side / halfW));
+        const fall = (1 - t / range) * (1 - Math.min(1, side / halfW));
         if (fall <= 0) continue;
-        const accel = this.fanPower * fall;
+        const accel = this.fanPowerOf(f) * fall;
         d.vx += f.dirX * accel * dt;
         d.vy += f.dirY * accel * dt;
         const sp = Math.hypot(d.vx, d.vy);
@@ -2693,6 +2798,55 @@ private hslToHex(h: number, s: number, l: number): string {
     }
   }
 
+  private renderFanMenu(): void {
+    const f = this.selectedFan;
+    if (!f) return;
+    const { ctx } = this;
+    const g = this.fanMenuGeom();
+    const panelH = g.header + 2 * (g.rowH + 8) + g.pad;
+    ctx.fillStyle = 'rgba(30, 30, 30, 0.92)';
+    ctx.fillRect(g.x, g.y, g.w, panelH);
+    ctx.strokeStyle = 'rgba(255, 215, 0, 0.55)';
+    ctx.strokeRect(g.x, g.y, g.w, panelH);
+    ctx.font = '13px system-ui, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#ffd700';
+    ctx.fillText('FAN', g.x + g.pad, g.y + g.pad + 10);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+    ctx.textAlign = 'right';
+    ctx.fillText('x', g.x + g.w - g.pad - 9, g.y + g.pad + 10);
+    ctx.textAlign = 'left';
+
+    const rowsTop = g.y + g.header;
+    const rows: ReadonlyArray<readonly [string, string, number]> = [
+      [`Power  Lv ${f.powerLv}`, `push strength ${Math.round(this.fanPowerOf(f))}`, this.fanPowerCost(f)],
+      [`Reach  Lv ${f.reachLv}`, `range ${Math.round(this.fanRangeOf(f))}px`, this.fanReachCost(f)],
+    ];
+    for (let i = 0; i < 2; i++) {
+      const ry = rowsTop + i * (g.rowH + 8);
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.05)';
+      ctx.fillRect(g.x + g.pad, ry, g.w - g.pad * 2, g.rowH);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '13px system-ui, sans-serif';
+      ctx.fillText(rows[i][0], g.x + g.pad + 8, ry + 16);
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.65)';
+      ctx.font = '11px system-ui, sans-serif';
+      ctx.fillText(rows[i][1], g.x + g.pad + 8, ry + 31);
+      const bx = g.x + g.w - g.pad - 120;
+      const by = ry + (g.rowH - 26) / 2;
+      const afford = this.money >= rows[i][2];
+      ctx.fillStyle = afford ? 'rgba(255, 215, 0, 0.85)' : 'rgba(120, 90, 20, 0.85)';
+      ctx.fillRect(bx, by, 120, 26);
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+      ctx.strokeRect(bx, by, 120, 26);
+      ctx.fillStyle = afford ? '#111111' : 'rgba(255, 255, 255, 0.85)';
+      ctx.font = '12px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(`$${rows[i][2]}`, bx + 60, by + 17);
+      ctx.textAlign = 'left';
+    }
+  }
+
   private renderWorldFans(): void {
     const { ctx } = this;
     const mx = this.mouseX / this.zoom + this.camX;
@@ -2701,9 +2855,21 @@ private hslToHex(h: number, s: number, l: number): string {
     for (let i = 0; i < this.fans.length; i++) {
       const f = this.fans[i];
       this.drawFanShape(f.x, f.y, f.dirX, f.dirY, 1);
-      if (i === this.hoveredFanIndex) {
-        this.drawFanHighlight(f.x, f.y);
+      if (i === this.hoveredFanIndex || this.selectedFan === f) {
+        this.drawFanHighlight(f.x, f.y, this.selectedFan === f);
       }
+    }
+    if (this.selectedFan) {
+      const f = this.selectedFan;
+      const cx = f.x + this.fanSize / 2;
+      const cy = f.y + this.fanSize / 2;
+      ctx.strokeStyle = 'rgba(255, 215, 0, 0.35)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 6]);
+      ctx.beginPath();
+      ctx.arc(cx, cy, this.fanRangeOf(f), 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
     }
     if (this.objectMode !== 'fan' || this.erasing) return;
     const pos = this.clampFanPos((this.fanDrag ? this.fanDrag.x : mx) - this.fanSize / 2, (this.fanDrag ? this.fanDrag.y : my) - this.fanSize / 2);
@@ -2731,10 +2897,10 @@ private hslToHex(h: number, s: number, l: number): string {
     this.drawFanShape(pos.x, pos.y, dx, dy, this.fanDrag ? 0.85 : 0.5, this.money >= this.fanCost);
   }
 
-  private drawFanHighlight(x: number, y: number): void {
+  private drawFanHighlight(x: number, y: number, selected = false): void {
     const { ctx } = this;
     const s = this.fanSize;
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+    ctx.strokeStyle = selected ? 'rgba(255, 215, 0, 0.95)' : 'rgba(255, 255, 255, 0.9)';
     ctx.lineWidth = 3;
     ctx.setLineDash([5, 3]);
     ctx.strokeRect(x - 2, y - 2, s + 4, s + 4);
@@ -2869,24 +3035,10 @@ private hslToHex(h: number, s: number, l: number): string {
 
     this.renderSplats();
 
-    ctx.fillStyle = '#4a90e2';
-    ctx.fillRect(this.bouncer.x, this.bouncer.y, this.blockSize, this.blockSize);
-    ctx.fillStyle = '#63b3ed';
+    this.renderBouncerBody(this.bouncer, true);
     for (const b of this.extraBouncers) {
-      ctx.fillRect(b.x, b.y, this.blockSize, this.blockSize);
+      this.renderBouncerBody(b, false);
     }
-
-    ctx.globalAlpha = 0.95;
-    for (const st of this.stains) {
-      ctx.fillStyle = st.color;
-      ctx.fillRect(
-        this.bouncer.x + this.blockSize / 2 + st.x - st.size / 2,
-        this.bouncer.y + this.blockSize / 2 + st.y - st.size / 2,
-        st.size,
-        st.size,
-      );
-    }
-    ctx.globalAlpha = 1;
 
     for (const d of this.droppers) {
       if (d.alive) {
@@ -2921,6 +3073,7 @@ private hslToHex(h: number, s: number, l: number): string {
     this.renderSettings();
     this.renderObjectsMenu();
     this.renderProducerMenu();
+    this.renderFanMenu();
 
     const bh = 30;
     const bx = 12;
@@ -2948,7 +3101,7 @@ private hslToHex(h: number, s: number, l: number): string {
       ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
       ctx.font = '12px system-ui, sans-serif';
       ctx.textAlign = 'center';
-      ctx.fillText('←/→ rotate', this.mouseX + 18, this.mouseY - 12);
+      ctx.fillText('←/→ rotate · click upgrade', this.mouseX + 18, this.mouseY - 12);
     }
 
     if (this.hoveredProducerIndex >= 0) {
