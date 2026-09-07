@@ -17,4 +17,6 @@ body {
   top: 0;
   left: 0;
   display: block;
+  touch-action: none;
+  cursor: crosshair;
 }

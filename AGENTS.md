@@ -43,6 +43,14 @@ Always run `npm run typecheck` (or `npm run build`) after making changes.
   asset in the `vite build` output is the symptom.
 - Canvas bitmap size is set from `window.innerWidth`/`innerHeight`, not
   `canvas.clientWidth`/`clientHeight` (which can read as 0 before layout).
+- Game world layers (`layer`/`solidLayer`/`bloodLayer`) are sized to the map, which is
+  the screen size at load time times the "Bigger Map" upgrade scale, hard-capped at
+  8192px per dimension. The world size is set once (on load/upgrade/reset), NOT
+  re-scaled on window resize. On `resize` the camera `zoom` is scaled so the whole game
+  tracks the window size (shrink the window and the game scales down; kept ≥ fit so the
+  world never gets cropped). Physics/drawing code must use `worldW`/`worldH` bounds,
+  never `canvas.width`/`canvas.height` (those are screen space). The camera
+  (`camX`/`camY`/`zoom`) maps world to screen; UI hit-testing stays in device space.
 - `index.html` should stay minimal: one canvas element, one module script tag.
 
 ## Updating this file
