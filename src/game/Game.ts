@@ -17,10 +17,11 @@ interface Dropper extends Body {
   respawnTimer: number;
   spawnVx: number;
   spawnVy: number;
-  spawnX: number;
   bounceBonus: number;
   stuckTimer: number;
   color: string;
+  gold: boolean;
+  producer: Producer | null;
 }
 
 interface Particle {
@@ -96,7 +97,7 @@ interface Material {
 }
 
 interface Upgrade {
-  id: 'cash' | 'respawn' | 'double' | 'extra' | 'map' | 'destroyer';
+  id: 'cash' | 'double' | 'map' | 'destroyer';
   name: string;
   desc: string;
   baseCost: number;
@@ -112,13 +113,30 @@ interface Fan {
   dirY: number;
 }
 
-type ObjectTool = 'pen' | 'fan';
+interface Producer {
+  x: number;
+  y: number;
+  speedLv: number;
+  countLv: number;
+}
+
+type ObjectTool = 'pen' | 'fan' | 'producer';
 
 interface DropperSave {
+  x?: number;
+  y?: number;
   spawnVx: number;
   spawnVy: number;
-  spawnX?: number;
   color: string;
+  gold?: boolean;
+  producer?: number;
+}
+
+interface ProducerSave {
+  x: number;
+  y: number;
+  speedLv?: number;
+  countLv?: number;
 }
 
 export class Game {
@@ -152,7 +170,6 @@ export class Game {
 
   private readonly blockSize = 24;
   private readonly bouncer: Body = { x: 0, y: 0, vx: 120, vy: 90 };
-  private readonly starterDrive = 160;
 
   private readonly gravity = 900;
   private readonly maxFall = 1400;
@@ -160,9 +177,8 @@ export class Game {
   private readonly bounciness = 0.55;
   private readonly friction = 0.82;
   private readonly frictionStop = 55;
-  private respawnTime = 1.5;
   private readonly topMatHeight = this.blockSize * 3 + 8;
-  private rewardPerDeath = 10;
+  private rewardPerDeath = 5;
   private money = 0;
 
   private readonly materials: readonly Material[] = [
@@ -173,6 +189,7 @@ export class Game {
   private readonly objectTools: ReadonlyArray<{ id: ObjectTool; name: string }> = [
     { id: 'pen', name: 'Ink Pen' },
     { id: 'fan', name: 'Fan' },
+    { id: 'producer', name: 'Producer' },
   ];
   private objectMode: ObjectTool = 'pen';
   private objectsOpen = false;
@@ -187,11 +204,22 @@ export class Game {
   private draggedFan: Fan | null = null;
   private hoveredFanIndex = -1;
 
+  private readonly producerW = 56;
+  private readonly producerH = 64;
+  private readonly producerCost = 50000;
+  private readonly producerSpeedBase = 75;
+  private readonly producerSpeedGrowth = 1.9;
+  private readonly producerCountBase = 250;
+  private readonly producerCountGrowth = 2.2;
+  private readonly producers: Producer[] = [];
+  private producerDrag: { x: number; y: number } | null = null;
+  private draggedProducer: Producer | null = null;
+  private selectedProducer: Producer | null = null;
+  private hoveredProducerIndex = -1;
+
   private readonly upgrades: readonly Upgrade[] = [
     { id: 'cash', name: 'Cash Boost', desc: '+$5 per death', baseCost: 50, growth: 1.9, maxLevel: Infinity, level: 0 },
-    { id: 'respawn', name: 'Fast Respawn', desc: 'spawn 20% faster', baseCost: 75, growth: 1.9, maxLevel: Infinity, level: 0 },
     { id: 'double', name: 'Double Kill', desc: '+15% double money', baseCost: 100, growth: 1.9, maxLevel: Infinity, level: 0 },
-    { id: 'extra', name: 'Extra Dropper', desc: '+1 dropper', baseCost: 250, growth: 2.2, maxLevel: Infinity, level: 0 },
     { id: 'map', name: 'Bigger Map', desc: '+50% map size', baseCost: 300, growth: 2.2, maxLevel: Infinity, level: 0 },
     { id: 'destroyer', name: 'Extra Bouncer', desc: '+1 destroyer', baseCost: 50000, growth: 2.2, maxLevel: Infinity, level: 0 },
   ];
@@ -266,7 +294,7 @@ export class Game {
     this.bouncer.x = Math.round(this.worldW / 2 - this.blockSize / 2);
     this.mouseX = this.canvas.width / 2;
     this.mouseY = this.canvas.height / 2;
-    this.droppers.push(this.createDropper(true));
+    this.createProducer(Math.round(this.worldW / 2 - this.producerW / 2), 8);
     this.loadSave();
     this.applyWorldSize();
     this.centerCamera();
@@ -347,6 +375,7 @@ export class Game {
       bouncer?: { x: number; y: number };
       extraBouncers?: { x: number; y: number }[];
       fans?: { x: number; y: number; dirX: number; dirY: number }[];
+      producers?: ProducerSave[];
     };
     try {
       data = JSON.parse(raw);
@@ -364,13 +393,45 @@ export class Game {
         }
       }
     }
-    this.rewardPerDeath = 10 + 5 * (this.upgrades.find((u) => u.id === 'cash')?.level ?? 0);
-    this.respawnTime = 1.5 * Math.pow(0.8, this.upgrades.find((u) => u.id === 'respawn')?.level ?? 0);
+    this.rewardPerDeath = 5 + 5 * (this.upgrades.find((u) => u.id === 'cash')?.level ?? 0);
     this.applyWorldSize();
-    const extra = this.upgrades.find((u) => u.id === 'extra')?.level ?? 0;
+    const savedProducers = data.producers;
+    if (savedProducers && savedProducers.length > 0) {
+      this.producers.length = 0;
+      this.droppers.length = 0;
+      for (const sp of savedProducers) {
+        if (typeof sp.x !== 'number' || typeof sp.y !== 'number') continue;
+        const pos = this.clampProducerPos(sp.x, sp.y);
+        this.producers.push({
+          x: pos.x,
+          y: pos.y,
+          speedLv: typeof sp.speedLv === 'number' && sp.speedLv >= 0 ? Math.floor(sp.speedLv) : 0,
+          countLv: typeof sp.countLv === 'number' && sp.countLv >= 0 ? Math.floor(sp.countLv) : 0,
+        });
+      }
+    }
     const savedDroppers = data.droppers ?? [];
-    for (let i = 0; i < extra; i++) {
-      this.droppers.push(this.createDropper(false, savedDroppers[i]));
+    for (const sd of savedDroppers) {
+      if (typeof sd.spawnVx !== 'number' || typeof sd.spawnVy !== 'number') continue;
+      if (typeof sd.producer !== 'number' || sd.producer < 0 || sd.producer >= this.producers.length) continue;
+      const p = this.producers[sd.producer];
+      this.droppers.push(this.createDropper(p, sd));
+    }
+    for (const p of this.producers) {
+      const want = 1 + p.countLv;
+      let have = 0;
+      for (let i = this.droppers.length - 1; i >= 0; i--) {
+        const d = this.droppers[i];
+        if (d.producer !== p) continue;
+        have++;
+        if (have > want) {
+          this.droppers.splice(i, 1);
+        }
+      }
+      while (have < want) {
+        this.droppers.push(this.createDropper(p));
+        have++;
+      }
     }
     if (typeof data.bloodDuration === 'number') {
       this.bloodDuration = Math.min(30, Math.max(5, data.bloodDuration));
@@ -438,6 +499,7 @@ export class Game {
     bouncer: { x: number; y: number };
     extraBouncers: { x: number; y: number }[];
     fans: { x: number; y: number; dirX: number; dirY: number }[];
+    producers: ProducerSave[];
   } {
     return {
       money: this.money,
@@ -445,10 +507,19 @@ export class Game {
       bloodDuration: this.bloodDuration,
       bloodAmount: this.bloodAmount,
       soundVolume: this.sfx.volume,
-      droppers: this.droppers.slice(1).map((d) => ({ spawnVx: d.spawnVx, spawnVy: d.spawnVy, spawnX: d.spawnX, color: d.color })),
+      droppers: this.droppers.map((d) => ({
+        x: d.x,
+        y: d.y,
+        spawnVx: d.spawnVx,
+        spawnVy: d.spawnVy,
+        color: d.color,
+        gold: d.gold,
+        producer: d.producer ? this.producers.indexOf(d.producer) : -1,
+      })),
       bouncer: { x: this.bouncer.x, y: this.bouncer.y },
       extraBouncers: this.extraBouncers.map((b) => ({ x: b.x, y: b.y })),
       fans: this.fans.map((f) => ({ x: f.x, y: f.y, dirX: f.dirX, dirY: f.dirY })),
+      producers: this.producers.map((p) => ({ x: p.x, y: p.y, speedLv: p.speedLv, countLv: p.countLv })),
     };
   }
 
@@ -704,6 +775,16 @@ export class Game {
           }
           return;
         }
+        const pi = this.hitProducerPoint(w.x, w.y);
+        if (pi >= 0) {
+          this.draggedProducer = this.producers[pi];
+          try {
+            this.canvas.setPointerCapture(e.pointerId);
+          } catch {
+            // pointer may already be gone
+          }
+          return;
+        }
         this.panActive = true;
         this.panStartX = p.x;
         this.panStartY = p.y;
@@ -772,11 +853,23 @@ export class Game {
     }
 
     const w = this.toWorldPoint(e);
+
+    const menuHit = this.hitProducerMenu(p.x, p.y);
+    if (menuHit === 'close') {
+      this.selectedProducer = null;
+      return;
+    }
+    if (menuHit === 'speed' || menuHit === 'count') {
+      this.tryBuyProducerUpgrade(menuHit);
+      return;
+    }
+
     this.drawX = w.x;
     this.drawY = w.y;
 
     if (this.erasing) {
       this.removeFansNear(w.x, w.y);
+      this.removeProducersNear(w.x, w.y);
       this.drawing = true;
       this.inkEpoch++;
       try {
@@ -786,6 +879,25 @@ export class Game {
       }
       this.drawWidth = this.eraserWidth * this.deviceScale;
       this.eraseAt(w.x, w.y, w.x, w.y);
+      return;
+    }
+
+    if (this.objectMode === 'pen') {
+      const pi = this.hitProducerPoint(w.x, w.y);
+      if (pi >= 0) {
+        this.selectedProducer = this.selectedProducer === this.producers[pi] ? null : this.producers[pi];
+        return;
+      }
+      this.selectedProducer = null;
+    }
+
+    if (this.objectMode === 'producer') {
+      this.producerDrag = { x: w.x, y: w.y };
+      try {
+        this.canvas.setPointerCapture(e.pointerId);
+      } catch {
+        // pointer may already be gone
+      }
       return;
     }
 
@@ -844,11 +956,19 @@ export class Game {
       return;
     }
     if (this.fanDrag) return;
+    if (this.producerDrag) return;
     if (this.draggedFan) {
       const w = this.toWorldPoint(e);
       const s = this.fanSize;
       this.draggedFan.x = Math.min(Math.max(w.x - s / 2, 0), this.worldW - s);
       this.draggedFan.y = Math.min(Math.max(w.y - s / 2, 0), this.worldH - s);
+      return;
+    }
+    if (this.draggedProducer) {
+      const w = this.toWorldPoint(e);
+      const pos = this.clampProducerPos(w.x - this.producerW / 2, w.y - this.producerH / 2);
+      this.draggedProducer.x = pos.x;
+      this.draggedProducer.y = pos.y;
       return;
     }
     if (!this.drawing && !this.dragged) return;
@@ -864,6 +984,7 @@ export class Game {
 
     if (this.erasing) {
       this.removeFansAlong(this.drawX, this.drawY, w.x, w.y);
+      this.removeProducersAlong(this.drawX, this.drawY, w.x, w.y);
       this.eraseAt(this.drawX, this.drawY, w.x, w.y);
       this.drawX = w.x;
       this.drawY = w.y;
@@ -920,8 +1041,17 @@ export class Game {
 
   private readonly onPointerUp = (e: PointerEvent): void => {
     if (this.fanDrag) {
-      this.placeFan(this.fanDrag.x, this.fanDrag.y);
+      if (this.placeFan(this.fanDrag.x, this.fanDrag.y)) {
+        this.objectMode = 'pen';
+      }
       this.fanDrag = null;
+      return;
+    }
+    if (this.producerDrag) {
+      if (this.placeProducer(this.producerDrag.x, this.producerDrag.y)) {
+        this.objectMode = 'pen';
+      }
+      this.producerDrag = null;
       return;
     }
     if (e.button === 2) {
@@ -933,6 +1063,10 @@ export class Game {
       if (this.draggedFan) {
         this.markSaveDirty();
         this.draggedFan = null;
+      }
+      if (this.draggedProducer) {
+        this.markSaveDirty();
+        this.draggedProducer = null;
       }
       this.panActive = false;
       return;
@@ -1154,9 +1288,9 @@ if (settle > 0) {
   private updateDropper(d: Dropper, dt: number): void {
     d.vy = Math.min(d.vy + this.gravity * dt, this.maxFall);
     const impact = this.stepBody(d, dt, this.bounciness, this.settleSpeed);
-    if (impact.approach >= this.settleSpeed) {
-      d.bounceBonus += Math.max(1, Math.round(impact.approach / 80)) * 5;
-      if (impact.ink && this.bounceSoundTimer <= 0) {
+    if (impact.approach >= this.settleSpeed && impact.ink) {
+      d.bounceBonus += 5;
+      if (this.bounceSoundTimer <= 0) {
         this.sfx.bounce(Math.min(impact.approach, 600));
         this.bounceSoundTimer = 0.1;
       }
@@ -1171,13 +1305,14 @@ if (settle > 0) {
       for (const d of this.droppers) {
         if (!d.alive) continue;
         if (b.x < d.x + s && b.x + s > d.x && b.y < d.y + s && b.y + s > d.y) {
-          this.explode(d, this.bloodDirection(b, d), d.color);
+          const deadColor = d.gold ? '#ffd700' : d.color;
+          this.explode(d, this.bloodDirection(b, d), deadColor);
           this.shake = Math.min(10, this.shake + 4);
           this.sfx.kill();
           d.alive = false;
-          d.respawnTimer = this.respawnTime;
+          d.respawnTimer = d.producer ? this.producerRespawnTime(d.producer) * (0.5 + Math.random() * 0.5) : 0;
           this.awardMoney(d);
-          this.addStain(b, d, d.color);
+          this.addStain(b, d, deadColor);
           if (this.dragged === d) {
             this.dragged = null;
           }
@@ -1201,7 +1336,7 @@ if (settle > 0) {
           this.shake = Math.min(10, this.shake + 4);
           this.sfx.kill();
           d.alive = false;
-          d.respawnTimer = this.respawnTime;
+          d.respawnTimer = d.producer ? this.producerRespawnTime(d.producer) * (0.5 + Math.random() * 0.5) : 0;
           d.stuckTimer = 0;
         }
       } else {
@@ -1211,10 +1346,15 @@ if (settle > 0) {
   }
 
   private awardMoney(d: Dropper): void {
-    let gain = this.rewardPerDeath + d.bounceBonus;
-    const double = this.upgrades.find((u) => u.id === 'double')?.level ?? 0;
-    if (Math.random() < double * 0.15) {
-      gain *= 2;
+    let gain: number;
+    if (d.gold) {
+      gain = 100000;
+    } else {
+      gain = this.rewardPerDeath + d.bounceBonus;
+      const double = this.upgrades.find((u) => u.id === 'double')?.level ?? 0;
+      if (Math.random() < double * 0.15) {
+        gain *= 2;
+      }
     }
     this.money += gain;
     d.bounceBonus = 0;
@@ -1275,14 +1415,13 @@ if (settle > 0) {
   }
 
   private hitResetButton(px: number, py: number): boolean {
-    const bh = 30;
-    const bw = 150;
-    const bx = 12;
-    const by = this.canvas.height - bh - 12;
-    return px >= bx && px <= bx + bw && py >= by && py <= by + bh;
+    if (!this.settingsOpen) return false;
+    const p = this.settingsPanel();
+    const g = this.settingsButtonsGeom();
+    return px >= p.x + p.pad && px <= p.x + p.pad + g.btnW && py >= g.resetBtnY && py <= g.resetBtnY + g.btnH;
   }
 
-  private readonly settingsButton = { x: 12, y: 30, w: 96, h: 26 };
+  private readonly settingsButton = { x: 12, y: 12, w: 96, h: 26 };
 
   private hitSettingsButton(px: number, py: number): boolean {
     const b = this.settingsButton;
@@ -1295,7 +1434,16 @@ if (settle > 0) {
   }
 
   private settingsPanel(): { x: number; y: number; w: number; rowH: number; gap: number; pad: number } {
-    return { x: 12, y: 64, w: 216, rowH: 34, gap: 6, pad: 8 };
+    return { x: 12, y: 46, w: 216, rowH: 34, gap: 6, pad: 8 };
+  }
+
+  private settingsButtonsGeom(): { btnH: number; btnW: number; btnY: number; resetBtnY: number } {
+    const p = this.settingsPanel();
+    const rows = 3;
+    const ctlTop = p.y + p.pad + rows * p.rowH + (rows - 1) * p.gap + 12;
+    const btnH = 28;
+    const btnW = p.w - p.pad * 2;
+    return { btnH, btnW, btnY: ctlTop + 6, resetBtnY: ctlTop + 6 + btnH + 8 };
   }
 
   private hitSettingsControl(px: number, py: number): { row: number; btn: 'minus' | 'plus' } | null {
@@ -1339,12 +1487,8 @@ if (settle > 0) {
   private hitClearBloodButton(px: number, py: number): boolean {
     if (!this.settingsOpen) return false;
     const p = this.settingsPanel();
-    const rows = 3;
-    const ctlTop = p.y + p.pad + rows * p.rowH + (rows - 1) * p.gap + 12;
-    const btnH = 28;
-    const btnY = ctlTop + 6;
-    const btnW = p.w - p.pad * 2;
-    return px >= p.x + p.pad && px <= p.x + p.pad + btnW && py >= btnY && py <= btnY + btnH;
+    const g = this.settingsButtonsGeom();
+    return px >= p.x + p.pad && px <= p.x + p.pad + g.btnW && py >= g.btnY && py <= g.btnY + g.btnH;
   }
 
   private clearBlood(): void {
@@ -1357,8 +1501,7 @@ if (settle > 0) {
 
   private resetAll(): void {
     this.money = 0;
-    this.rewardPerDeath = 10;
-    this.respawnTime = 1.5;
+    this.rewardPerDeath = 5;
     for (const up of this.upgrades) {
       up.level = 0;
     }
@@ -1374,10 +1517,14 @@ if (settle > 0) {
     this.droppers.length = 0;
     this.extraBouncers.length = 0;
     this.fans.length = 0;
+    this.producers.length = 0;
     this.fanDrag = null;
     this.draggedFan = null;
+    this.producerDrag = null;
+    this.draggedProducer = null;
+    this.selectedProducer = null;
     this.applyWorldSize();
-    this.droppers.push(this.createDropper(true));
+    this.createProducer(Math.round(this.worldW / 2 - this.producerW / 2), 8);
     this.centerCamera();
     try {
       localStorage.removeItem(this.saveKey);
@@ -1399,11 +1546,7 @@ if (settle > 0) {
     this.sfx.buy();
     this.markSaveDirty();
     if (up.id === 'cash') {
-      this.rewardPerDeath = 10 + 5 * up.level;
-    } else if (up.id === 'respawn') {
-      this.respawnTime = 1.5 * Math.pow(0.8, up.level);
-    } else if (up.id === 'extra') {
-      this.droppers.push(this.createDropper(false));
+      this.rewardPerDeath = 5 + 5 * up.level;
     } else if (up.id === 'map') {
       this.applyWorldSize();
     } else if (up.id === 'destroyer') {
@@ -1432,19 +1575,21 @@ if (settle > 0) {
     const controls: ReadonlyArray<string> = [
       'left-drag: draw / place objects',
       'fan: drag to aim the arrow',
-      'right-drag: move blocks/fans / pan',
+      'producer: drag to place, click to upgrade',
+      'right-drag: move blocks/fans/producers / pan',
       'scroll: zoom',
-      `E: eraser (${this.erasing ? 'ON' : 'off'}, fans too)`,
+      `E: eraser (${this.erasing ? 'ON' : 'off'}, fans/producers too)`,
       'R: clear ink',
       `M: sound (${this.sfx.muted ? 'off' : 'on'})`,
     ];
-    const ctlTop = p.y + p.pad + rows.length * p.rowH + (rows.length - 1) * p.gap + 12;
-    const btnH = 28;
-    const btnY = ctlTop + 6;
-    const btnW = p.w - p.pad * 2;
+    const g = this.settingsButtonsGeom();
+    const btnH = g.btnH;
+    const btnY = g.btnY;
+    const btnW = g.btnW;
+    const resetBtnY = g.resetBtnY;
     const ctlHeaderH = 18;
     const ctlLineH = 17;
-    const ctlTop2 = btnY + btnH + 10;
+    const ctlTop2 = resetBtnY + btnH + 10;
     const panelH = ctlTop2 + ctlHeaderH + controls.length * ctlLineH + p.pad;
     ctx.fillStyle = 'rgba(30, 30, 30, 0.9)';
     ctx.fillRect(p.x, p.y, p.w, panelH);
@@ -1482,6 +1627,14 @@ if (settle > 0) {
     ctx.fillStyle = '#ffffff';
     ctx.textAlign = 'center';
     ctx.fillText('Clear Blood', p.x + p.w / 2, btnY + btnH / 2 + 4);
+    ctx.textAlign = 'left';
+    ctx.fillStyle = 'rgba(140, 36, 36, 0.9)';
+    ctx.fillRect(p.x + p.pad, resetBtnY, btnW, btnH);
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+    ctx.strokeRect(p.x + p.pad, resetBtnY, btnW, btnH);
+    ctx.fillStyle = '#ffffff';
+    ctx.textAlign = 'center';
+    ctx.fillText('Reset All Progress', p.x + p.w / 2, resetBtnY + btnH / 2 + 4);
     ctx.textAlign = 'left';
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
     ctx.beginPath();
@@ -1675,36 +1828,95 @@ private hslToHex(h: number, s: number, l: number): string {
     return color;
   }
 
-  private randomSpawnVelocity(): { vx: number; vy: number } {
-    const angle = Math.random() * Math.PI * 2;
-    const speed = 80 + Math.random() * 240;
-    return { vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed };
+  private goldChance(): number {
+    return 0.01;
   }
 
-  private createDropper(starter: boolean, spawn?: DropperSave): Dropper {
-    let v: { vx: number; vy: number };
-    if (starter) {
-      v = { vx: this.starterDrive, vy: 0 };
-    } else if (spawn) {
-      v = { vx: spawn.spawnVx, vy: spawn.spawnVy };
-    } else {
-      v = this.randomSpawnVelocity();
+  private rollGold(): boolean {
+    return Math.random() < this.goldChance();
+  }
+
+  private spawnGoldBurst(x: number, y: number): void {
+    for (let i = 0; i < 22; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 60 + Math.random() * 180;
+      const life = 0.5 + Math.random() * 0.7;
+      this.particles.push({
+        x: x + (Math.random() - 0.5) * 14,
+        y: y + (Math.random() - 0.5) * 14,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed - 90,
+        life,
+        maxLife: life,
+        size: 2 + Math.random() * 3,
+        color: Math.random() < 0.5 ? '#ffd700' : '#fff2a8',
+      });
     }
-    const spawnX = Math.round(this.worldW / 2 - this.blockSize / 2);
+  }
+
+  private emitGoldParticles(d: Dropper, dt: number): void {
+    const cx = d.x + this.blockSize / 2;
+    const cy = d.y + this.blockSize / 2;
+    const phase = (d.x * 7 + d.y * 13) % 1;
+    const interval = 0.09;
+    const prev = Math.floor((this.time - dt + phase) / interval);
+    const now = Math.floor((this.time + phase) / interval);
+    for (let i = 0; i < now - prev; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 20 + Math.random() * 60;
+      const life = 0.4 + Math.random() * 0.5;
+      this.particles.push({
+        x: cx + (Math.random() - 0.5) * 10,
+        y: cy + (Math.random() - 0.5) * 10,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed - 30,
+        life,
+        maxLife: life,
+        size: 1.5 + Math.random() * 2,
+        color: Math.random() < 0.5 ? '#ffd700' : '#fff2a8',
+      });
+    }
+  }
+
+  private createDropper(producer: Producer, spawn?: DropperSave): Dropper {
+    const spawnX = Math.round(producer.x + (this.producerW - this.blockSize) / 2);
+    const spawnY = Math.round(producer.y + this.producerH);
+    const v = spawn ? { vx: spawn.spawnVx, vy: spawn.spawnVy } : { vx: (Math.random() - 0.5) * 120, vy: 40 + Math.random() * 60 };
+    const x = spawn && typeof spawn.x === 'number' ? Math.min(Math.max(spawn.x, 0), this.worldW - this.blockSize) : spawnX;
+    const y = spawn && typeof spawn.y === 'number' ? Math.min(Math.max(spawn.y, 0), this.worldH - this.blockSize) : spawnY;
+    const gold = spawn?.gold ?? this.rollGold();
+    if (gold) {
+      this.spawnGoldBurst(x + this.blockSize / 2, y + this.blockSize / 2);
+    }
     return {
-      x: spawn?.spawnX ?? spawnX,
-      y: 0,
+      x,
+      y,
       vx: v.vx,
       vy: v.vy,
       alive: true,
       respawnTimer: 0,
       spawnVx: v.vx,
       spawnVy: v.vy,
-      spawnX: spawn?.spawnX ?? spawnX,
       bounceBonus: 0,
       stuckTimer: 0,
       color: spawn?.color ?? this.nextDropperColor(),
+      gold,
+      producer,
     };
+  }
+
+  private createProducer(x: number, y: number, speedLv = 0, countLv = 0): Producer {
+    const p: Producer = { x, y, speedLv, countLv };
+    this.producers.push(p);
+    const want = 1 + countLv;
+    for (let i = 0; i < want; i++) {
+      this.droppers.push(this.createDropper(p));
+    }
+    return p;
+  }
+
+  private producerRespawnTime(p: Producer): number {
+    return 1.5 * Math.pow(0.8, p.speedLv);
   }
 
   private createExtraBouncer(): Body {
@@ -1927,17 +2139,35 @@ private hslToHex(h: number, s: number, l: number): string {
   }
 
   private respawnDropper(dt: number): void {
-    for (const d of this.droppers) {
+    for (let i = this.droppers.length - 1; i >= 0; i--) {
+      const d = this.droppers[i];
       if (d.alive) continue;
       d.respawnTimer -= dt;
       if (d.respawnTimer > 0) continue;
-      d.x = d.spawnX;
-      d.y = 0;
+      if (!d.producer) {
+        this.droppers.splice(i, 1);
+        continue;
+      }
+      d.x = Math.round(d.producer.x + (this.producerW - this.blockSize) / 2);
+      d.y = Math.round(d.producer.y + this.producerH);
       d.vx = d.spawnVx;
       d.vy = d.spawnVy;
       d.alive = true;
       d.bounceBonus = 0;
       d.stuckTimer = 0;
+      d.gold = this.rollGold();
+      if (d.gold) {
+        this.spawnGoldBurst(d.x + this.blockSize / 2, d.y + this.blockSize / 2);
+        this.rings.push({
+          x: d.x + this.blockSize / 2,
+          y: d.y + this.blockSize / 2,
+          maxR: 44,
+          born: this.time,
+          life: 0.6,
+          color: '#ffd700',
+          width: 4,
+        });
+      }
       this.sfx.respawn();
     }
   }
@@ -2044,10 +2274,11 @@ private hslToHex(h: number, s: number, l: number): string {
       ctx.textAlign = 'left';
       ctx.fillText(selected ? '> ' : '', p.x + p.pad + 6, ry + p.rowH / 2 + 4.5);
       ctx.fillText(tool.name, p.x + p.pad + 22, ry + p.rowH / 2 + 4.5);
-      if (tool.id === 'fan') {
+      if (tool.id === 'fan' || tool.id === 'producer') {
         ctx.textAlign = 'right';
-        ctx.fillStyle = this.money >= this.fanCost ? 'rgba(255, 255, 255, 0.85)' : 'rgba(255, 80, 80, 0.95)';
-        ctx.fillText(`$${this.fanCost}`, p.x + p.w - p.pad - 6, ry + p.rowH / 2 + 4.5);
+        const cost = tool.id === 'fan' ? this.fanCost : this.producerCost;
+        ctx.fillStyle = this.money >= cost ? 'rgba(255, 255, 255, 0.85)' : 'rgba(255, 80, 80, 0.95)';
+        ctx.fillText(`$${cost}`, p.x + p.w - p.pad - 6, ry + p.rowH / 2 + 4.5);
       }
     }
   }
@@ -2094,16 +2325,16 @@ private hslToHex(h: number, s: number, l: number): string {
     this.markSaveDirty();
   }
 
-  private placeFan(sx: number, sy: number): void {
+  private placeFan(sx: number, sy: number): boolean {
     if (this.money < this.fanCost) {
       this.sfx.deny();
-      return;
+      return false;
     }
     const s = this.fanSize;
     const pos = this.clampFanPos(sx - s / 2, sy - s / 2);
     if (this.hitFanIndex(pos.x, pos.y) >= 0) {
       this.sfx.deny();
-      return;
+      return false;
     }
     const cx = pos.x + s / 2;
     const cy = pos.y + s / 2;
@@ -2123,6 +2354,7 @@ private hslToHex(h: number, s: number, l: number): string {
     this.money -= this.fanCost;
     this.sfx.buy();
     this.markSaveDirty();
+    return true;
   }
 
   private fanEraserRadius(): number {
@@ -2153,6 +2385,153 @@ private hslToHex(h: number, s: number, l: number): string {
       const t = i / steps;
       this.removeFansNear(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t);
     }
+  }
+
+  private clampProducerPos(x: number, y: number): { x: number; y: number } {
+    return {
+      x: Math.min(Math.max(Math.round(x), 0), Math.max(0, this.worldW - this.producerW)),
+      y: Math.min(Math.max(Math.round(y), 0), Math.max(0, this.worldH - this.producerH)),
+    };
+  }
+
+  private hitProducerIndex(x: number, y: number): number {
+    for (let i = 0; i < this.producers.length; i++) {
+      const p = this.producers[i];
+      if (x < p.x + this.producerW && x + this.producerW > p.x && y < p.y + this.producerH && y + this.producerH > p.y) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  private hitProducerPoint(px: number, py: number): number {
+    for (let i = 0; i < this.producers.length; i++) {
+      const p = this.producers[i];
+      if (px >= p.x && px < p.x + this.producerW && py >= p.y && py < p.y + this.producerH) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  private placeProducer(sx: number, sy: number): boolean {
+    if (this.money < this.producerCost) {
+      this.sfx.deny();
+      return false;
+    }
+    const pos = this.clampProducerPos(sx - this.producerW / 2, sy - this.producerH / 2);
+    if (this.hitProducerIndex(pos.x, pos.y) >= 0) {
+      this.sfx.deny();
+      return false;
+    }
+    this.money -= this.producerCost;
+    this.sfx.buy();
+    this.createProducer(pos.x, pos.y);
+    this.markSaveDirty();
+    return true;
+  }
+
+  private removeProducer(i: number): void {
+    const pr = this.producers[i];
+    for (const d of this.droppers) {
+      if (d.producer === pr) {
+        d.producer = null;
+      }
+    }
+    if (this.draggedProducer === pr) {
+      this.draggedProducer = null;
+    }
+    if (this.selectedProducer === pr) {
+      this.selectedProducer = null;
+    }
+    this.producers.splice(i, 1);
+  }
+
+  private removeProducersNear(x: number, y: number): void {
+    const r = this.fanEraserRadius();
+    let removed = false;
+    for (let i = this.producers.length - 1; i >= 0; i--) {
+      const p = this.producers[i];
+      if (x >= p.x - r && x <= p.x + this.producerW + r && y >= p.y - r && y <= p.y + this.producerH + r) {
+        this.removeProducer(i);
+        removed = true;
+      }
+    }
+    if (removed) {
+      this.markSaveDirty();
+    }
+  }
+
+  private removeProducersAlong(x0: number, y0: number, x1: number, y1: number): void {
+    const r = this.fanEraserRadius();
+    const len = Math.hypot(x1 - x0, y1 - y0);
+    const steps = Math.max(1, Math.ceil(len / Math.max(1, r)));
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      this.removeProducersNear(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t);
+    }
+  }
+
+  private producerSpeedCost(p: Producer): number {
+    return Math.round(this.producerSpeedBase * Math.pow(this.producerSpeedGrowth, p.speedLv));
+  }
+
+  private producerCountCost(p: Producer): number {
+    return Math.round(this.producerCountBase * Math.pow(this.producerCountGrowth, p.countLv));
+  }
+
+  private tryBuyProducerUpgrade(kind: 'speed' | 'count'): void {
+    const p = this.selectedProducer;
+    if (!p) return;
+    const cost = kind === 'speed' ? this.producerSpeedCost(p) : this.producerCountCost(p);
+    if (this.money < cost) {
+      this.sfx.deny();
+      return;
+    }
+    this.money -= cost;
+    if (kind === 'speed') {
+      p.speedLv++;
+    } else {
+      p.countLv++;
+      this.droppers.push(this.createDropper(p));
+    }
+    this.sfx.buy();
+    this.markSaveDirty();
+  }
+
+  private producerMenuGeom(): { x: number; y: number; w: number; rowH: number; pad: number; header: number } {
+    const rowH = 42;
+    const pad = 10;
+    const header = 26;
+    return {
+      x: Math.round(this.canvas.width / 2 - 170),
+      y: this.canvas.height - (header + 2 * (rowH + 8) + pad) - 12,
+      w: 340,
+      rowH,
+      pad,
+      header,
+    };
+  }
+
+  private hitProducerMenu(px: number, py: number): 'speed' | 'count' | 'close' | null {
+    const p = this.selectedProducer;
+    if (!p) return null;
+    const g = this.producerMenuGeom();
+    const panelH = g.header + 2 * (g.rowH + 8) + g.pad;
+    if (px < g.x || px > g.x + g.w || py < g.y || py > g.y + panelH) return null;
+    const closeX = g.x + g.w - g.pad - 26;
+    const closeY = g.y + g.pad - 2;
+    if (px >= closeX && px <= closeX + 26 && py >= closeY && py <= closeY + 20) return 'close';
+    const rowsTop = g.y + g.header;
+    for (let i = 0; i < 2; i++) {
+      const ry = rowsTop + i * (g.rowH + 8);
+      const bx = g.x + g.w - g.pad - 120;
+      const by = ry + (g.rowH - 26) / 2;
+      if (px >= bx && px <= bx + 120 && py >= by && py <= by + 26) {
+        return i === 0 ? 'speed' : 'count';
+      }
+    }
+    return null;
   }
 
   private updateFans(dt: number): void {
@@ -2209,6 +2588,109 @@ private hslToHex(h: number, s: number, l: number): string {
       }
     }
     return false;
+  }
+
+  private renderWorldProducers(): void {
+    const mx = this.mouseX / this.zoom + this.camX;
+    const my = this.mouseY / this.zoom + this.camY;
+    this.hoveredProducerIndex = this.hitProducerPoint(mx, my);
+    for (let i = 0; i < this.producers.length; i++) {
+      const p = this.producers[i];
+      this.drawProducerShape(p.x, p.y, 1);
+      if (i === this.hoveredProducerIndex || this.selectedProducer === p) {
+        this.drawProducerHighlight(p.x, p.y, this.selectedProducer === p);
+      }
+    }
+    if (this.objectMode !== 'producer' || this.erasing) return;
+    const pos = this.clampProducerPos(
+      (this.producerDrag ? this.producerDrag.x : mx) - this.producerW / 2,
+      (this.producerDrag ? this.producerDrag.y : my) - this.producerH / 2,
+    );
+    this.drawProducerShape(pos.x, pos.y, this.producerDrag ? 0.85 : 0.5, this.money >= this.producerCost);
+  }
+
+  private drawProducerHighlight(x: number, y: number, selected: boolean): void {
+    const { ctx } = this;
+    ctx.strokeStyle = selected ? 'rgba(255, 215, 0, 0.95)' : 'rgba(255, 255, 255, 0.9)';
+    ctx.lineWidth = 3;
+    ctx.setLineDash([5, 3]);
+    ctx.strokeRect(x - 2, y - 2, this.producerW + 4, this.producerH + 4);
+    ctx.setLineDash([]);
+  }
+
+  private drawProducerShape(x: number, y: number, alpha: number, affordable = true): void {
+    const { ctx } = this;
+    const w = this.producerW;
+    const h = this.producerH;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = affordable ? '#3d3d3d' : 'rgba(180, 60, 60, 0.85)';
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x, y, w, h);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.12)';
+    ctx.fillRect(x, y, w, 10);
+    ctx.fillStyle = 'rgba(20, 20, 20, 0.9)';
+    ctx.fillRect(x + w / 2 - 7, y + h - 14, 14, 14);
+    ctx.strokeStyle = 'rgba(255, 220, 120, 0.6)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(x + w / 2 - 7, y + h - 14, 14, 14);
+    ctx.fillStyle = '#2b2b2b';
+    ctx.fillRect(x + w - 14, y - 8, 8, 10);
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+    ctx.strokeRect(x + w - 14, y - 8, 8, 10);
+    ctx.restore();
+  }
+
+  private renderProducerMenu(): void {
+    const p = this.selectedProducer;
+    if (!p) return;
+    const { ctx } = this;
+    const g = this.producerMenuGeom();
+    const panelH = g.header + 2 * (g.rowH + 8) + g.pad;
+    ctx.fillStyle = 'rgba(30, 30, 30, 0.92)';
+    ctx.fillRect(g.x, g.y, g.w, panelH);
+    ctx.strokeStyle = 'rgba(255, 215, 0, 0.55)';
+    ctx.strokeRect(g.x, g.y, g.w, panelH);
+    ctx.font = '13px system-ui, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#ffd700';
+    ctx.fillText('PRODUCER', g.x + g.pad, g.y + g.pad + 10);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+    ctx.textAlign = 'right';
+    ctx.fillText('x', g.x + g.w - g.pad - 9, g.y + g.pad + 10);
+    ctx.textAlign = 'left';
+
+    const rowsTop = g.y + g.header;
+    const respawn = this.producerRespawnTime(p);
+    const rows: ReadonlyArray<readonly [string, string, number, boolean]> = [
+      [`Respawn Speed  Lv ${p.speedLv}`, `${respawn.toFixed(2)}s between respawns`, this.producerSpeedCost(p), true],
+      [`Dropper Count  Lv ${p.countLv}`, `${1 + p.countLv} droppers active`, this.producerCountCost(p), false],
+    ];
+    for (let i = 0; i < 2; i++) {
+      const ry = rowsTop + i * (g.rowH + 8);
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.05)';
+      ctx.fillRect(g.x + g.pad, ry, g.w - g.pad * 2, g.rowH);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '13px system-ui, sans-serif';
+      ctx.fillText(rows[i][0], g.x + g.pad + 8, ry + 16);
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.65)';
+      ctx.font = '11px system-ui, sans-serif';
+      ctx.fillText(rows[i][1], g.x + g.pad + 8, ry + 31);
+      const bx = g.x + g.w - g.pad - 120;
+      const by = ry + (g.rowH - 26) / 2;
+      const afford = this.money >= rows[i][2];
+      ctx.fillStyle = afford ? 'rgba(255, 215, 0, 0.85)' : 'rgba(120, 90, 20, 0.85)';
+      ctx.fillRect(bx, by, 120, 26);
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+      ctx.strokeRect(bx, by, 120, 26);
+      ctx.fillStyle = afford ? '#111111' : 'rgba(255, 255, 255, 0.85)';
+      ctx.font = '12px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(`$${rows[i][2]}`, bx + 60, by + 17);
+      ctx.textAlign = 'left';
+    }
   }
 
   private renderWorldFans(): void {
@@ -2310,8 +2792,13 @@ private hslToHex(h: number, s: number, l: number): string {
       this.updateBouncer(dt);
     }
     for (const d of this.droppers) {
-      if (this.dragged !== d && d.alive) {
-        this.updateDropper(d, dt);
+      if (d.alive) {
+        if (d.gold) {
+          this.emitGoldParticles(d, dt);
+        }
+        if (this.dragged !== d) {
+          this.updateDropper(d, dt);
+        }
       }
     }
     this.updateFans(dt);
@@ -2364,27 +2851,6 @@ private hslToHex(h: number, s: number, l: number): string {
       }
     }
 
-    const mh = this.topMatHeight;
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(0, 0, ww, mh);
-    ctx.clip();
-    ctx.fillStyle = '#c0392b';
-    ctx.fillRect(0, 0, ww, mh);
-    ctx.fillStyle = '#8e2424';
-    const period = 30;
-    for (let sx = -wh; sx < ww + wh; sx += period) {
-      ctx.beginPath();
-      ctx.moveTo(sx, 0);
-      ctx.lineTo(sx + mh, mh);
-      ctx.lineTo(sx + mh + 15, mh);
-      ctx.lineTo(sx + 15, 0);
-      ctx.fill();
-    }
-    ctx.restore();
-    ctx.fillStyle = '#7a1f1f';
-    ctx.fillRect(0, mh, ww, 3);
-
     ctx.drawImage(this.layer, 0, 0);
 
     const life = this.splatLifetime();
@@ -2424,7 +2890,7 @@ private hslToHex(h: number, s: number, l: number): string {
 
     for (const d of this.droppers) {
       if (d.alive) {
-        ctx.fillStyle = d.color;
+        ctx.fillStyle = d.gold ? '#ffd700' : d.color;
         ctx.fillRect(d.x, d.y, this.blockSize, this.blockSize);
       }
     }
@@ -2447,25 +2913,22 @@ private hslToHex(h: number, s: number, l: number): string {
       ctx.stroke();
     }
     ctx.globalAlpha = 1;
+    this.renderWorldProducers();
     this.renderWorldFans();
     ctx.restore();
 
     this.renderUpgrades();
     this.renderSettings();
     this.renderObjectsMenu();
+    this.renderProducerMenu();
 
     const bh = 30;
-    const bw = 150;
     const bx = 12;
     const by = this.canvas.height - bh - 12;
-    ctx.fillStyle = 'rgba(30, 30, 30, 0.85)';
-    ctx.fillRect(bx, by, bw, bh);
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
-    ctx.strokeRect(bx, by, bw, bh);
     ctx.fillStyle = '#ffffff';
     ctx.font = '13px system-ui, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('Reset All Progress', bx + bw / 2, by + bh / 2 + 4.5);
+    ctx.textAlign = 'left';
+    ctx.fillText(`money: $${this.money}   droppers: ${this.droppers.length}`, bx, by + bh / 2 + 4.5);
 
     if (this.erasing) {
       const r = (this.eraserWidth * this.deviceScale * this.zoom) / 2;
@@ -2488,9 +2951,11 @@ private hslToHex(h: number, s: number, l: number): string {
       ctx.fillText('←/→ rotate', this.mouseX + 18, this.mouseY - 12);
     }
 
-    ctx.fillStyle = '#ffffff';
-    ctx.font = '13px system-ui, sans-serif';
-    ctx.textAlign = 'left';
-    ctx.fillText(`money: $${this.money}   droppers: ${this.droppers.length}`, 8, 16);
+    if (this.hoveredProducerIndex >= 0) {
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+      ctx.font = '12px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('click to upgrade', this.mouseX + 18, this.mouseY - 12);
+    }
   }
 }
