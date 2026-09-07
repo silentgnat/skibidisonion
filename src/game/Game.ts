@@ -22,6 +22,7 @@ interface Dropper extends Body {
   color: string;
   gold: boolean;
   producer: Producer | null;
+  trailPts: { x: number; y: number }[];
 }
 
 interface Particle {
@@ -90,7 +91,7 @@ interface Material {
 }
 
 interface Upgrade {
-  id: 'cash' | 'double' | 'map' | 'destroyer';
+  id: 'cash' | 'double' | 'map';
   name: string;
   desc: string;
   baseCost: number;
@@ -113,9 +114,10 @@ interface Producer {
   y: number;
   speedLv: number;
   countLv: number;
+  trailLv: number;
 }
 
-type ObjectTool = 'pen' | 'fan' | 'producer';
+type ObjectTool = 'pen' | 'fan' | 'producer' | 'destroyer';
 
 interface DropperSave {
   x?: number;
@@ -132,6 +134,7 @@ interface ProducerSave {
   y: number;
   speedLv?: number;
   countLv?: number;
+  trailLv?: number;
 }
 
 export class Game {
@@ -185,9 +188,12 @@ export class Game {
     { id: 'pen', name: 'Ink Pen' },
     { id: 'fan', name: 'Fan' },
     { id: 'producer', name: 'Producer' },
+    { id: 'destroyer', name: 'Extra Bouncer' },
   ];
   private objectMode: ObjectTool = 'pen';
   private objectsOpen = false;
+  private secretOpen = false;
+  private freePlace = false;
 
   private readonly fanSize = 30;
   private readonly fanRangeBase = 160;
@@ -196,12 +202,14 @@ export class Game {
   private readonly fanPowerGrowth = 1.5;
   private readonly fanMaxSpeed = 1300;
   private readonly fanCost = 10000;
+  private readonly extraBouncerCost = 50000;
   private readonly fanReachUpBase = 12000;
   private readonly fanReachUpGrowth = 1.9;
   private readonly fanPowerUpBase = 15000;
   private readonly fanPowerUpGrowth = 1.9;
   private readonly fans: Fan[] = [];
   private fanDrag: { x: number; y: number } | null = null;
+  private bouncerDrag: { x: number; y: number } | null = null;
   private draggedFan: Fan | null = null;
   private hoveredFanIndex = -1;
   private selectedFan: Fan | null = null;
@@ -213,6 +221,8 @@ export class Game {
   private readonly producerSpeedGrowth = 1.9;
   private readonly producerCountBase = 250;
   private readonly producerCountGrowth = 2.2;
+  private readonly producerTrailBase = 300;
+  private readonly producerTrailGrowth = 1.9;
   private readonly producers: Producer[] = [];
   private producerDrag: { x: number; y: number } | null = null;
   private draggedProducer: Producer | null = null;
@@ -223,7 +233,6 @@ export class Game {
     { id: 'cash', name: 'Cash Boost', desc: '+$5 per death', baseCost: 50, growth: 1.9, maxLevel: Infinity, level: 0 },
     { id: 'double', name: 'Double Kill', desc: '+15% double money', baseCost: 100, growth: 1.9, maxLevel: Infinity, level: 0 },
     { id: 'map', name: 'Bigger Map', desc: '+50% map size', baseCost: 300, growth: 2.2, maxLevel: Infinity, level: 0 },
-    { id: 'destroyer', name: 'Extra Bouncer', desc: '+1 destroyer', baseCost: 50000, growth: 2.2, maxLevel: Infinity, level: 0 },
   ];
 
   private readonly droppers: Dropper[] = [];
@@ -408,6 +417,7 @@ export class Game {
           y: pos.y,
           speedLv: typeof sp.speedLv === 'number' && sp.speedLv >= 0 ? Math.floor(sp.speedLv) : 0,
           countLv: typeof sp.countLv === 'number' && sp.countLv >= 0 ? Math.floor(sp.countLv) : 0,
+          trailLv: typeof sp.trailLv === 'number' && sp.trailLv >= 0 ? Math.floor(sp.trailLv) : 0,
         });
       }
     }
@@ -451,14 +461,12 @@ export class Game {
       this.bouncer.x = Math.min(Math.max(data.bouncer.x, 0), this.worldW - this.blockSize);
       this.bouncer.y = Math.min(Math.max(data.bouncer.y, this.topMatHeight), this.worldH - this.blockSize);
     }
-    const destroyerLevel = this.upgrades.find((u) => u.id === 'destroyer')?.level ?? 0;
     const savedExtra = data.extraBouncers ?? [];
-    for (let i = 0; i < destroyerLevel; i++) {
+    for (const se of savedExtra) {
+      if (typeof se.x !== 'number' || typeof se.y !== 'number') continue;
       const b = this.createExtraBouncer();
-      if (savedExtra[i] && typeof savedExtra[i].x === 'number' && typeof savedExtra[i].y === 'number') {
-        b.x = Math.min(Math.max(savedExtra[i].x, 0), this.worldW - this.blockSize);
-        b.y = Math.min(Math.max(savedExtra[i].y, this.topMatHeight), this.worldH - this.blockSize);
-      }
+      b.x = Math.min(Math.max(se.x, 0), this.worldW - this.blockSize);
+      b.y = Math.min(Math.max(se.y, this.topMatHeight), this.worldH - this.blockSize);
       this.extraBouncers.push(b);
     }
     const savedFans = data.fans ?? [];
@@ -527,7 +535,7 @@ export class Game {
       bouncer: { x: this.bouncer.x, y: this.bouncer.y },
       extraBouncers: this.extraBouncers.map((b) => ({ x: b.x, y: b.y })),
       fans: this.fans.map((f) => ({ x: f.x, y: f.y, dirX: f.dirX, dirY: f.dirY, powerLv: f.powerLv, reachLv: f.reachLv })),
-      producers: this.producers.map((p) => ({ x: p.x, y: p.y, speedLv: p.speedLv, countLv: p.countLv })),
+      producers: this.producers.map((p) => ({ x: p.x, y: p.y, speedLv: p.speedLv, countLv: p.countLv, trailLv: p.trailLv })),
     };
   }
 
@@ -770,6 +778,16 @@ export class Game {
     this.sfx.ensure();
     if (e.button === 2) {
       const p = this.toDevicePoint(e);
+      if (this.selectedProducer) {
+        const menuHit = this.hitProducerMenu(p.x, p.y);
+        if (menuHit === 'trail') {
+          this.downgradeProducerTrail();
+          return;
+        }
+        if (menuHit !== null) {
+          return;
+        }
+      }
       const w = this.toWorldPoint(e);
       const body = this.pickBody(w.x, w.y);
       if (!body) {
@@ -810,6 +828,10 @@ export class Game {
       this.storedVy = body.vy;
       body.vx = 0;
       body.vy = 0;
+      const grabbedDropper = this.droppers.find((d) => d === body);
+      if (grabbedDropper) {
+        grabbedDropper.bounceBonus = 0;
+      }
       try {
         this.canvas.setPointerCapture(e.pointerId);
       } catch {
@@ -831,11 +853,17 @@ export class Game {
     }
     if (this.hitSettingsButton(p.x, p.y)) {
       this.settingsOpen = !this.settingsOpen;
+      if (this.settingsOpen) {
+        this.upgradesOpen = false;
+        this.objectsOpen = false;
+      }
       return;
     }
     if (this.hitUpgradesButton(p.x, p.y)) {
       this.upgradesOpen = !this.upgradesOpen;
       if (this.upgradesOpen) {
+        this.settingsOpen = false;
+        this.objectsOpen = false;
         this.clampUpgradeScroll();
       }
       return;
@@ -851,13 +879,32 @@ export class Game {
     }
     if (this.hitObjectsButton(p.x, p.y)) {
       this.objectsOpen = !this.objectsOpen;
+      if (this.objectsOpen) {
+        this.settingsOpen = false;
+        this.upgradesOpen = false;
+      }
       return;
     }
     const tool = this.hitObjectRow(p.x, p.y);
     if (tool >= 0) {
       this.objectMode = this.objectTools[tool].id;
       this.objectsOpen = false;
+      this.freePlace = false;
       return;
+    }
+    if (this.hitSecretButton(p.x, p.y)) {
+      this.secretOpen = !this.secretOpen;
+      if (this.secretOpen) {
+        this.money = Number.MAX_SAFE_INTEGER;
+      }
+      return;
+    }
+    if (this.secretOpen) {
+      const si = this.hitSecretRow(p.x, p.y);
+      if (si >= 0) {
+        this.selectSecretObject(si);
+        return;
+      }
     }
 
     const w = this.toWorldPoint(e);
@@ -867,7 +914,7 @@ export class Game {
       this.selectedProducer = null;
       return;
     }
-    if (menuHit === 'speed' || menuHit === 'count') {
+    if (menuHit === 'speed' || menuHit === 'count' || menuHit === 'trail') {
       this.tryBuyProducerUpgrade(menuHit);
       return;
     }
@@ -888,6 +935,7 @@ export class Game {
     if (this.erasing) {
       this.removeFansNear(w.x, w.y);
       this.removeProducersNear(w.x, w.y);
+      this.removeExtraBouncersNear(w.x, w.y);
       this.drawing = true;
       this.inkEpoch++;
       try {
@@ -929,6 +977,16 @@ export class Game {
 
     if (this.objectMode === 'fan') {
       this.fanDrag = { x: w.x, y: w.y };
+      try {
+        this.canvas.setPointerCapture(e.pointerId);
+      } catch {
+        // pointer may already be gone
+      }
+      return;
+    }
+
+    if (this.objectMode === 'destroyer') {
+      this.bouncerDrag = { x: w.x, y: w.y };
       try {
         this.canvas.setPointerCapture(e.pointerId);
       } catch {
@@ -983,6 +1041,7 @@ export class Game {
     }
     if (this.fanDrag) return;
     if (this.producerDrag) return;
+    if (this.bouncerDrag) return;
     if (this.draggedFan) {
       const w = this.toWorldPoint(e);
       const s = this.fanSize;
@@ -1011,6 +1070,7 @@ export class Game {
     if (this.erasing) {
       this.removeFansAlong(this.drawX, this.drawY, w.x, w.y);
       this.removeProducersAlong(this.drawX, this.drawY, w.x, w.y);
+      this.removeExtraBouncersAlong(this.drawX, this.drawY, w.x, w.y);
       this.eraseAt(this.drawX, this.drawY, w.x, w.y);
       this.drawX = w.x;
       this.drawY = w.y;
@@ -1078,6 +1138,13 @@ export class Game {
         this.objectMode = 'pen';
       }
       this.producerDrag = null;
+      return;
+    }
+    if (this.bouncerDrag) {
+      if (this.placeExtraBouncer(this.bouncerDrag.x, this.bouncerDrag.y)) {
+        this.objectMode = 'pen';
+      }
+      this.bouncerDrag = null;
       return;
     }
     if (e.button === 2) {
@@ -1336,6 +1403,7 @@ if (settle > 0) {
           this.shake = Math.min(10, this.shake + 4);
           this.sfx.kill();
           d.alive = false;
+          d.trailPts.length = 0;
           d.respawnTimer = d.producer ? this.producerRespawnTime(d.producer) * (0.5 + Math.random() * 0.5) : 0;
           this.awardMoney(d);
           if (this.dragged === d) {
@@ -1361,6 +1429,7 @@ if (settle > 0) {
           this.shake = Math.min(10, this.shake + 4);
           this.sfx.kill();
           d.alive = false;
+          d.trailPts.length = 0;
           d.respawnTimer = d.producer ? this.producerRespawnTime(d.producer) * (0.5 + Math.random() * 0.5) : 0;
           d.stuckTimer = 0;
         }
@@ -1459,7 +1528,7 @@ if (settle > 0) {
   }
 
   private settingsPanel(): { x: number; y: number; w: number; rowH: number; gap: number; pad: number } {
-    return { x: 12, y: 46, w: 216, rowH: 34, gap: 6, pad: 8 };
+    return { x: 12, y: 46, w: 264, rowH: 34, gap: 6, pad: 8 };
   }
 
   private settingsButtonsGeom(): { btnH: number; btnW: number; btnY: number; resetBtnY: number } {
@@ -1507,6 +1576,10 @@ if (settle > 0) {
       this.sfx.bounce(5);
     }
     this.markSaveDirty();
+    if (!this.secretAvailable()) {
+      this.secretOpen = false;
+      this.freePlace = false;
+    }
   }
 
   private hitClearBloodButton(px: number, py: number): boolean {
@@ -1547,6 +1620,8 @@ if (settle > 0) {
     this.draggedProducer = null;
     this.selectedProducer = null;
     this.selectedFan = null;
+    this.secretOpen = false;
+    this.freePlace = false;
     this.applyWorldSize();
     this.createProducer(Math.round(this.worldW / 2 - this.producerW / 2), 8);
     this.centerCamera();
@@ -1573,8 +1648,6 @@ if (settle > 0) {
       this.rewardPerDeath = 5 + 5 * up.level;
     } else if (up.id === 'map') {
       this.applyWorldSize();
-    } else if (up.id === 'destroyer') {
-      this.extraBouncers.push(this.createExtraBouncer());
     }
   }
 
@@ -1884,6 +1957,58 @@ private hslToHex(h: number, s: number, l: number): string {
     }
   }
 
+  private emitTrailParticles(d: Dropper, dt: number): void {
+    const lv = d.producer ? d.producer.trailLv : 0;
+    if (lv <= 0) return;
+    const cx = d.x + this.blockSize / 2;
+    const cy = d.y + this.blockSize / 2;
+    const interval = Math.max(0.02, 0.08 / lv);
+    const phase = (d.x * 11 + d.y * 17) % 1;
+    const prev = Math.floor((this.time - dt + phase) / interval);
+    const now = Math.floor((this.time + phase) / interval);
+    for (let i = 0; i < now - prev; i++) {
+      this.particles.push({
+        x: cx + (Math.random() - 0.5) * 8,
+        y: cy + (Math.random() - 0.5) * 8,
+        vx: -d.vx * 0.2 + (Math.random() - 0.5) * 20,
+        vy: -d.vy * 0.2 + (Math.random() - 0.5) * 20,
+        life: 0.35 + Math.random() * 0.25,
+        maxLife: 0.6,
+        size: 2 + Math.random() * (1 + Math.min(lv, 3)),
+        color: d.gold ? '#ffd700' : this.shadeColor(d.color, 0.8),
+      });
+    }
+  }
+
+  private updateTrail(d: Dropper): void {
+    const lv = d.producer ? d.producer.trailLv : 0;
+    if (lv < 2) return;
+    const cx = d.x + this.blockSize / 2;
+    const cy = d.y + this.blockSize / 2;
+    const last = d.trailPts[d.trailPts.length - 1];
+    if (last && Math.hypot(cx - last.x, cy - last.y) < 4) return;
+    d.trailPts.push({ x: cx, y: cy });
+  }
+
+  private renderTrail(d: Dropper): void {
+    const pts = d.trailPts;
+    if (pts.length < 2) return;
+    const { ctx } = this;
+    const lv = d.producer ? d.producer.trailLv : 0;
+    const color = d.gold ? '#ffd700' : d.color;
+    ctx.strokeStyle = color;
+    ctx.lineCap = 'round';
+    ctx.globalAlpha = 0.85;
+    ctx.lineWidth = Math.max(1, 2 + lv * 0.4);
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) {
+      ctx.lineTo(pts[i].x, pts[i].y);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
   private createDropper(producer: Producer, spawn?: DropperSave): Dropper {
     const spawnX = Math.round(producer.x + (this.producerW - this.blockSize) / 2);
     const spawnY = Math.round(producer.y + this.producerH);
@@ -1908,11 +2033,12 @@ private hslToHex(h: number, s: number, l: number): string {
       color: spawn?.color ?? this.nextDropperColor(),
       gold,
       producer,
+      trailPts: [],
     };
   }
 
-  private createProducer(x: number, y: number, speedLv = 0, countLv = 0): Producer {
-    const p: Producer = { x, y, speedLv, countLv };
+  private createProducer(x: number, y: number, speedLv = 0, countLv = 0, trailLv = 0): Producer {
+    const p: Producer = { x, y, speedLv, countLv, trailLv };
     this.producers.push(p);
     const want = 1 + countLv;
     for (let i = 0; i < want; i++) {
@@ -2184,6 +2310,7 @@ private hslToHex(h: number, s: number, l: number): string {
       d.alive = true;
       d.bounceBonus = 0;
       d.stuckTimer = 0;
+      d.trailPts.length = 0;
       d.gold = this.rollGold();
       if (d.gold) {
         this.spawnGoldBurst(d.x + this.blockSize / 2, d.y + this.blockSize / 2);
@@ -2248,11 +2375,11 @@ private hslToHex(h: number, s: number, l: number): string {
   }
 
   private objectsButton(): { x: number; y: number; w: number; h: number } {
-    return { x: this.canvas.width / 2 - 55, y: 12, w: 110, h: 26 };
+    return { x: this.canvas.width / 2 - 80, y: 12, w: 160, h: 26 };
   }
 
   private objectsPanelGeom(): { x: number; y: number; w: number; rowH: number; gap: number; pad: number } {
-    return { x: this.canvas.width / 2 - 80, y: 46, w: 160, rowH: 26, gap: 6, pad: 8 };
+    return { x: this.canvas.width / 2 - 105, y: 46, w: 210, rowH: 26, gap: 6, pad: 8 };
   }
 
   private hitObjectsButton(px: number, py: number): boolean {
@@ -2303,13 +2430,95 @@ private hslToHex(h: number, s: number, l: number): string {
       ctx.textAlign = 'left';
       ctx.fillText(selected ? '> ' : '', p.x + p.pad + 6, ry + p.rowH / 2 + 4.5);
       ctx.fillText(tool.name, p.x + p.pad + 22, ry + p.rowH / 2 + 4.5);
-      if (tool.id === 'fan' || tool.id === 'producer') {
+      if (tool.id === 'fan' || tool.id === 'producer' || tool.id === 'destroyer') {
         ctx.textAlign = 'right';
-        const cost = tool.id === 'fan' ? this.fanCost : this.producerCost;
+        const cost =
+          tool.id === 'fan' ? this.fanCost : tool.id === 'producer' ? this.producerCost : this.extraBouncerCost;
         ctx.fillStyle = this.money >= cost ? 'rgba(255, 255, 255, 0.85)' : 'rgba(255, 80, 80, 0.95)';
         ctx.fillText(`$${cost}`, p.x + p.w - p.pad - 6, ry + p.rowH / 2 + 4.5);
       }
     }
+  }
+
+  private secretAvailable(): boolean {
+    return this.bloodDuration === 17 && this.bloodAmount === 2.5 && this.sfx.volume === 175;
+  }
+
+  private secretObjects(): ReadonlyArray<{ id: ObjectTool; name: string }> {
+    return this.objectTools;
+  }
+
+  private secretButton(): { x: number; y: number; w: number; h: number } {
+    return { x: this.canvas.width - 72, y: Math.round(this.canvas.height / 2 - 13), w: 60, h: 26 };
+  }
+
+  private secretPanelGeom(): { x: number; y: number; w: number; rowH: number; gap: number; pad: number } {
+    const b = this.secretButton();
+    return { x: b.x - 118, y: b.y + b.h + 4, w: 110, rowH: 24, gap: 4, pad: 6 };
+  }
+
+  private hitSecretButton(px: number, py: number): boolean {
+    if (!this.secretAvailable()) return false;
+    const b = this.secretButton();
+    return px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h;
+  }
+
+  private hitSecretRow(px: number, py: number): number {
+    if (!this.secretOpen) return -1;
+    const g = this.secretPanelGeom();
+    const list = this.secretObjects();
+    for (let i = 0; i < list.length; i++) {
+      const ry = g.y + g.pad + i * (g.rowH + g.gap);
+      if (px >= g.x + g.pad && px <= g.x + g.w - g.pad && py >= ry && py <= ry + g.rowH) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  private selectSecretObject(i: number): void {
+    const list = this.secretObjects();
+    const obj = list[i];
+    if (!obj) return;
+    this.objectMode = obj.id;
+    this.freePlace = true;
+    this.secretOpen = false;
+    this.sfx.buy();
+  }
+
+  private renderSecretMenu(): void {
+    if (!this.secretAvailable()) return;
+    const { ctx } = this;
+    const b = this.secretButton();
+    ctx.fillStyle = 'rgba(90, 20, 120, 0.9)';
+    ctx.fillRect(b.x, b.y, b.w, b.h);
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+    ctx.strokeRect(b.x, b.y, b.w, b.h);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '12px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('SECRET', b.x + b.w / 2, b.y + b.h / 2 + 4);
+    if (!this.secretOpen) return;
+    const g = this.secretPanelGeom();
+    const list = this.secretObjects();
+    const n = list.length;
+    const panelH = g.pad + n * g.rowH + (n - 1) * g.gap + g.pad;
+    ctx.fillStyle = 'rgba(30, 30, 30, 0.92)';
+    ctx.fillRect(g.x, g.y, g.w, panelH);
+    ctx.strokeStyle = 'rgba(200, 120, 255, 0.5)';
+    ctx.strokeRect(g.x, g.y, g.w, panelH);
+    ctx.textAlign = 'left';
+    for (let i = 0; i < n; i++) {
+      const ry = g.y + g.pad + i * (g.rowH + g.gap);
+      const obj = list[i];
+      ctx.fillStyle =
+        this.objectMode === obj.id ? 'rgba(255, 255, 255, 0.14)' : 'rgba(255, 255, 255, 0.04)';
+      ctx.fillRect(g.x + g.pad, ry, g.w - g.pad * 2, g.rowH);
+      ctx.fillStyle = '#ffe08a';
+      ctx.font = '12px system-ui, sans-serif';
+      ctx.fillText(obj.name, g.x + g.pad + 8, ry + g.rowH / 2 + 4);
+    }
+    ctx.textAlign = 'left';
   }
 
   private clampFanPos(x: number, y: number): { x: number; y: number } {
@@ -2355,7 +2564,7 @@ private hslToHex(h: number, s: number, l: number): string {
   }
 
   private placeFan(sx: number, sy: number): boolean {
-    if (this.money < this.fanCost) {
+    if (!this.freePlace && this.money < this.fanCost) {
       this.sfx.deny();
       return false;
     }
@@ -2380,7 +2589,9 @@ private hslToHex(h: number, s: number, l: number): string {
       dy /= len;
     }
     this.fans.push({ x: pos.x, y: pos.y, dirX: dx, dirY: dy, powerLv: 0, reachLv: 0 });
-    this.money -= this.fanCost;
+    if (!this.freePlace) {
+      this.money -= this.fanCost;
+    }
     this.sfx.buy();
     this.markSaveDirty();
     return true;
@@ -2422,6 +2633,67 @@ private hslToHex(h: number, s: number, l: number): string {
     }
   }
 
+  private clampExtraBouncerPos(x: number, y: number): { x: number; y: number } {
+    const s = this.blockSize;
+    return {
+      x: Math.min(Math.max(Math.round(x), 0), Math.max(0, this.worldW - s)),
+      y: Math.min(Math.max(Math.round(y), this.topMatHeight), Math.max(0, this.worldH - s)),
+    };
+  }
+
+  private placeExtraBouncer(sx: number, sy: number): boolean {
+    if (!this.freePlace && this.money < this.extraBouncerCost) {
+      this.sfx.deny();
+      return false;
+    }
+    const s = this.blockSize;
+    const pos = this.clampExtraBouncerPos(sx - s / 2, sy - s / 2);
+    const b = { x: pos.x, y: pos.y, vx: 0, vy: 0 };
+    const overlap =
+      (b.x < this.bouncer.x + s && b.x + s > this.bouncer.x && b.y < this.bouncer.y + s && b.y + s > this.bouncer.y) ||
+      this.extraBouncers.some((e) => b.x < e.x + s && b.x + s > e.x && b.y < e.y + s && b.y + s > e.y);
+    if (overlap) {
+      this.sfx.deny();
+      return false;
+    }
+    this.extraBouncers.push(b);
+    if (!this.freePlace) {
+      this.money -= this.extraBouncerCost;
+    }
+    this.sfx.buy();
+    this.markSaveDirty();
+    return true;
+  }
+
+  private removeExtraBouncersNear(x: number, y: number): void {
+    const s = this.blockSize;
+    const r = this.fanEraserRadius();
+    let removed = false;
+    for (let i = this.extraBouncers.length - 1; i >= 0; i--) {
+      const b = this.extraBouncers[i];
+      if (x >= b.x - r && x <= b.x + s + r && y >= b.y - r && y <= b.y + s + r) {
+        if (this.dragged === b) {
+          this.dragged = null;
+        }
+        this.extraBouncers.splice(i, 1);
+        removed = true;
+      }
+    }
+    if (removed) {
+      this.markSaveDirty();
+    }
+  }
+
+  private removeExtraBouncersAlong(x0: number, y0: number, x1: number, y1: number): void {
+    const r = this.fanEraserRadius();
+    const len = Math.hypot(x1 - x0, y1 - y0);
+    const steps = Math.max(1, Math.ceil(len / Math.max(1, r)));
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      this.removeExtraBouncersNear(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t);
+    }
+  }
+
   private clampProducerPos(x: number, y: number): { x: number; y: number } {
     return {
       x: Math.min(Math.max(Math.round(x), 0), Math.max(0, this.worldW - this.producerW)),
@@ -2450,7 +2722,7 @@ private hslToHex(h: number, s: number, l: number): string {
   }
 
   private placeProducer(sx: number, sy: number): boolean {
-    if (this.money < this.producerCost) {
+    if (!this.freePlace && this.money < this.producerCost) {
       this.sfx.deny();
       return false;
     }
@@ -2459,7 +2731,9 @@ private hslToHex(h: number, s: number, l: number): string {
       this.sfx.deny();
       return false;
     }
-    this.money -= this.producerCost;
+    if (!this.freePlace) {
+      this.money -= this.producerCost;
+    }
     this.sfx.buy();
     this.createProducer(pos.x, pos.y);
     this.markSaveDirty();
@@ -2471,6 +2745,7 @@ private hslToHex(h: number, s: number, l: number): string {
     for (const d of this.droppers) {
       if (d.producer === pr) {
         d.producer = null;
+        d.trailPts.length = 0;
       }
     }
     if (this.draggedProducer === pr) {
@@ -2515,10 +2790,19 @@ private hslToHex(h: number, s: number, l: number): string {
     return Math.round(this.producerCountBase * Math.pow(this.producerCountGrowth, p.countLv));
   }
 
-  private tryBuyProducerUpgrade(kind: 'speed' | 'count'): void {
+  private producerTrailCost(p: Producer): number {
+    return Math.round(this.producerTrailBase * Math.pow(this.producerTrailGrowth, p.trailLv));
+  }
+
+  private tryBuyProducerUpgrade(kind: 'speed' | 'count' | 'trail'): void {
     const p = this.selectedProducer;
     if (!p) return;
-    const cost = kind === 'speed' ? this.producerSpeedCost(p) : this.producerCountCost(p);
+    if (kind === 'trail' && p.trailLv >= 2) {
+      this.sfx.deny();
+      return;
+    }
+    const cost =
+      kind === 'speed' ? this.producerSpeedCost(p) : kind === 'count' ? this.producerCountCost(p) : this.producerTrailCost(p);
     if (this.money < cost) {
       this.sfx.deny();
       return;
@@ -2526,9 +2810,30 @@ private hslToHex(h: number, s: number, l: number): string {
     this.money -= cost;
     if (kind === 'speed') {
       p.speedLv++;
-    } else {
+    } else if (kind === 'count') {
       p.countLv++;
       this.droppers.push(this.createDropper(p));
+    } else {
+      p.trailLv++;
+    }
+    this.sfx.buy();
+    this.markSaveDirty();
+  }
+
+  private downgradeProducerTrail(): void {
+    const p = this.selectedProducer;
+    if (!p || p.trailLv <= 0) {
+      this.sfx.deny();
+      return;
+    }
+    this.money += this.producerTrailCost(p);
+    p.trailLv--;
+    if (p.trailLv < 2) {
+      for (const d of this.droppers) {
+        if (d.producer === p) {
+          d.trailPts.length = 0;
+        }
+      }
     }
     this.sfx.buy();
     this.markSaveDirty();
@@ -2540,7 +2845,7 @@ private hslToHex(h: number, s: number, l: number): string {
     const header = 26;
     return {
       x: Math.round(this.canvas.width / 2 - 170),
-      y: this.canvas.height - (header + 2 * (rowH + 8) + pad) - 12,
+      y: this.canvas.height - (header + 3 * (rowH + 8) + pad) - 12,
       w: 340,
       rowH,
       pad,
@@ -2548,22 +2853,22 @@ private hslToHex(h: number, s: number, l: number): string {
     };
   }
 
-  private hitProducerMenu(px: number, py: number): 'speed' | 'count' | 'close' | null {
+  private hitProducerMenu(px: number, py: number): 'speed' | 'count' | 'trail' | 'close' | null {
     const p = this.selectedProducer;
     if (!p) return null;
     const g = this.producerMenuGeom();
-    const panelH = g.header + 2 * (g.rowH + 8) + g.pad;
+    const panelH = g.header + 3 * (g.rowH + 8) + g.pad;
     if (px < g.x || px > g.x + g.w || py < g.y || py > g.y + panelH) return null;
     const closeX = g.x + g.w - g.pad - 26;
     const closeY = g.y + g.pad - 2;
     if (px >= closeX && px <= closeX + 26 && py >= closeY && py <= closeY + 20) return 'close';
     const rowsTop = g.y + g.header;
-    for (let i = 0; i < 2; i++) {
+    for (let i = 0; i < 3; i++) {
       const ry = rowsTop + i * (g.rowH + 8);
       const bx = g.x + g.w - g.pad - 120;
       const by = ry + (g.rowH - 26) / 2;
       if (px >= bx && px <= bx + 120 && py >= by && py <= by + 26) {
-        return i === 0 ? 'speed' : 'count';
+        return i === 0 ? 'speed' : i === 1 ? 'count' : 'trail';
       }
     }
     return null;
@@ -2711,7 +3016,7 @@ private hslToHex(h: number, s: number, l: number): string {
       (this.producerDrag ? this.producerDrag.x : mx) - this.producerW / 2,
       (this.producerDrag ? this.producerDrag.y : my) - this.producerH / 2,
     );
-    this.drawProducerShape(pos.x, pos.y, this.producerDrag ? 0.85 : 0.5, this.money >= this.producerCost);
+    this.drawProducerShape(pos.x, pos.y, this.producerDrag ? 0.85 : 0.5, this.freePlace || this.money >= this.producerCost);
   }
 
   private drawProducerHighlight(x: number, y: number, selected: boolean): void {
@@ -2753,7 +3058,7 @@ private hslToHex(h: number, s: number, l: number): string {
     if (!p) return;
     const { ctx } = this;
     const g = this.producerMenuGeom();
-    const panelH = g.header + 2 * (g.rowH + 8) + g.pad;
+    const panelH = g.header + 3 * (g.rowH + 8) + g.pad;
     ctx.fillStyle = 'rgba(30, 30, 30, 0.92)';
     ctx.fillRect(g.x, g.y, g.w, panelH);
     ctx.strokeStyle = 'rgba(255, 215, 0, 0.55)';
@@ -2769,11 +3074,13 @@ private hslToHex(h: number, s: number, l: number): string {
 
     const rowsTop = g.y + g.header;
     const respawn = this.producerRespawnTime(p);
-    const rows: ReadonlyArray<readonly [string, string, number, boolean]> = [
-      [`Respawn Speed  Lv ${p.speedLv}`, `${respawn.toFixed(2)}s between respawns`, this.producerSpeedCost(p), true],
-      [`Dropper Count  Lv ${p.countLv}`, `${1 + p.countLv} droppers active`, this.producerCountCost(p), false],
+    const trailMaxed = p.trailLv >= 2;
+    const rows: ReadonlyArray<readonly [string, string, number]> = [
+      [`Respawn Speed  Lv ${p.speedLv}`, `${respawn.toFixed(2)}s between respawns`, this.producerSpeedCost(p)],
+      [`Dropper Count  Lv ${p.countLv}`, `${1 + p.countLv} droppers active`, this.producerCountCost(p)],
+      [`Trail  Lv ${p.trailLv}`, `Lv2+ leaves a line behind droppers`, trailMaxed ? 0 : this.producerTrailCost(p)],
     ];
-    for (let i = 0; i < 2; i++) {
+    for (let i = 0; i < 3; i++) {
       const ry = rowsTop + i * (g.rowH + 8);
       ctx.fillStyle = 'rgba(255, 255, 255, 0.05)';
       ctx.fillRect(g.x + g.pad, ry, g.w - g.pad * 2, g.rowH);
@@ -2785,15 +3092,16 @@ private hslToHex(h: number, s: number, l: number): string {
       ctx.fillText(rows[i][1], g.x + g.pad + 8, ry + 31);
       const bx = g.x + g.w - g.pad - 120;
       const by = ry + (g.rowH - 26) / 2;
-      const afford = this.money >= rows[i][2];
-      ctx.fillStyle = afford ? 'rgba(255, 215, 0, 0.85)' : 'rgba(120, 90, 20, 0.85)';
+      const maxed = i === 2 && trailMaxed;
+      const afford = maxed ? false : this.money >= rows[i][2];
+      ctx.fillStyle = maxed ? 'rgba(90, 90, 90, 0.85)' : afford ? 'rgba(255, 215, 0, 0.85)' : 'rgba(120, 90, 20, 0.85)';
       ctx.fillRect(bx, by, 120, 26);
       ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
       ctx.strokeRect(bx, by, 120, 26);
-      ctx.fillStyle = afford ? '#111111' : 'rgba(255, 255, 255, 0.85)';
+      ctx.fillStyle = maxed ? 'rgba(255, 255, 255, 0.85)' : afford ? '#111111' : 'rgba(255, 255, 255, 0.85)';
       ctx.font = '12px system-ui, sans-serif';
       ctx.textAlign = 'center';
-      ctx.fillText(`$${rows[i][2]}`, bx + 60, by + 17);
+      ctx.fillText(maxed ? 'MAX' : `$${rows[i][2]}`, bx + 60, by + 17);
       ctx.textAlign = 'left';
     }
   }
@@ -2894,7 +3202,29 @@ private hslToHex(h: number, s: number, l: number): string {
       ctx.stroke();
       ctx.setLineDash([]);
     }
-    this.drawFanShape(pos.x, pos.y, dx, dy, this.fanDrag ? 0.85 : 0.5, this.money >= this.fanCost);
+    this.drawFanShape(pos.x, pos.y, dx, dy, this.fanDrag ? 0.85 : 0.5, this.freePlace || this.money >= this.fanCost);
+  }
+
+  private renderWorldExtraBouncers(): void {
+    if (this.objectMode !== 'destroyer' || this.erasing) return;
+    const mx = this.mouseX / this.zoom + this.camX;
+    const my = this.mouseY / this.zoom + this.camY;
+    const s = this.blockSize;
+    const pos = this.clampExtraBouncerPos(
+      (this.bouncerDrag ? this.bouncerDrag.x : mx) - s / 2,
+      (this.bouncerDrag ? this.bouncerDrag.y : my) - s / 2,
+    );
+    const { ctx } = this;
+    ctx.globalAlpha = this.bouncerDrag ? 0.85 : 0.5;
+    this.renderBouncerBody({ x: pos.x, y: pos.y, vx: 0, vy: 0 }, false);
+    ctx.globalAlpha = 1;
+    if (!this.freePlace && this.money < this.extraBouncerCost) {
+      ctx.strokeStyle = 'rgba(255, 80, 80, 0.9)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([5, 3]);
+      ctx.strokeRect(pos.x - 2, pos.y - 2, s + 4, s + 4);
+      ctx.setLineDash([]);
+    }
   }
 
   private drawFanHighlight(x: number, y: number, selected = false): void {
@@ -2962,6 +3292,10 @@ private hslToHex(h: number, s: number, l: number): string {
         if (d.gold) {
           this.emitGoldParticles(d, dt);
         }
+        if (d.producer && d.producer.trailLv > 0) {
+          this.emitTrailParticles(d, dt);
+        }
+        this.updateTrail(d);
         if (this.dragged !== d) {
           this.updateDropper(d, dt);
         }
@@ -3042,6 +3376,7 @@ private hslToHex(h: number, s: number, l: number): string {
 
     for (const d of this.droppers) {
       if (d.alive) {
+        this.renderTrail(d);
         ctx.fillStyle = d.gold ? '#ffd700' : d.color;
         ctx.fillRect(d.x, d.y, this.blockSize, this.blockSize);
       }
@@ -3067,6 +3402,7 @@ private hslToHex(h: number, s: number, l: number): string {
     ctx.globalAlpha = 1;
     this.renderWorldProducers();
     this.renderWorldFans();
+    this.renderWorldExtraBouncers();
     ctx.restore();
 
     this.renderUpgrades();
@@ -3074,6 +3410,7 @@ private hslToHex(h: number, s: number, l: number): string {
     this.renderObjectsMenu();
     this.renderProducerMenu();
     this.renderFanMenu();
+    this.renderSecretMenu();
 
     const bh = 30;
     const bx = 12;
@@ -3081,7 +3418,7 @@ private hslToHex(h: number, s: number, l: number): string {
     ctx.fillStyle = '#ffffff';
     ctx.font = '13px system-ui, sans-serif';
     ctx.textAlign = 'left';
-    ctx.fillText(`money: $${this.money}   droppers: ${this.droppers.length}`, bx, by + bh / 2 + 4.5);
+    ctx.fillText(`money: $${this.money}   producers: ${this.producers.length}`, bx, by + bh / 2 + 4.5);
 
     if (this.erasing) {
       const r = (this.eraserWidth * this.deviceScale * this.zoom) / 2;
@@ -3095,20 +3432,6 @@ private hslToHex(h: number, s: number, l: number): string {
       ctx.beginPath();
       ctx.arc(this.mouseX, this.mouseY, r, 0, Math.PI * 2);
       ctx.stroke();
-    }
-
-    if (this.hoveredFanIndex >= 0) {
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
-      ctx.font = '12px system-ui, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText('←/→ rotate · click upgrade', this.mouseX + 18, this.mouseY - 12);
-    }
-
-    if (this.hoveredProducerIndex >= 0) {
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
-      ctx.font = '12px system-ui, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText('click to upgrade', this.mouseX + 18, this.mouseY - 12);
     }
   }
 }
