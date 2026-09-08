@@ -5,11 +5,14 @@ interface Body {
   y: number;
   vx: number;
   vy: number;
+  color?: string;
+  kills?: number;
 }
 
 interface StepResult {
   approach: number;
   ink: boolean;
+  bouncy: boolean;
 }
 
 interface Dropper extends Body {
@@ -47,7 +50,7 @@ interface Ring {
 }
 
 type Splat =
-  | { kind: 'blob'; born: number; x: number; y: number; size: number; color: string; alpha: number }
+  | { kind: 'blob'; born: number; x: number; y: number; size: number; color: string; alpha: number; rot: number; fadeStart?: number }
   | {
       kind: 'streak';
       born: number;
@@ -58,29 +61,9 @@ type Splat =
       angle: number;
       color: string;
       alpha: number;
-    }
-  | {
-      kind: 'drip';
-      born: number;
-      x: number;
-      y: number;
-      width: number;
-      color: string;
-      alpha: number;
-      speed: number;
-      vy: number;
-      contact: boolean;
-      startY: number;
+      skew: number;
+      fadeStart?: number;
     };
-
-interface WorldStain {
-  x: number;
-  y: number;
-  size: number;
-  color: string;
-  alpha: number;
-  born: number;
-}
 
 interface Material {
   name: string;
@@ -88,6 +71,8 @@ interface Material {
   solid: boolean;
   width: number;
   alpha: number;
+  solidColor?: string;
+  cost?: number;
 }
 
 interface Upgrade {
@@ -115,9 +100,10 @@ interface Producer {
   speedLv: number;
   countLv: number;
   trailLv: number;
+  colorLv: number;
 }
 
-type ObjectTool = 'pen' | 'fan' | 'producer' | 'destroyer';
+type ObjectTool = 'pen' | 'fan' | 'producer' | 'destroyer' | 'bank';
 
 interface DropperSave {
   x?: number;
@@ -135,6 +121,25 @@ interface ProducerSave {
   speedLv?: number;
   countLv?: number;
   trailLv?: number;
+  colorLv?: number;
+}
+
+interface Bank {
+  x: number;
+  y: number;
+  money: number;
+  valueLv: number;
+  capLv: number;
+  autoLv: number;
+}
+
+interface BankSave {
+  x: number;
+  y: number;
+  money?: number;
+  valueLv?: number;
+  capLv?: number;
+  autoLv?: number;
 }
 
 export class Game {
@@ -178,10 +183,16 @@ export class Game {
   private readonly topMatHeight = this.blockSize * 3 + 8;
   private rewardPerDeath = 5;
   private money = 0;
+  private prestigeLevel = 0;
+  private lifetimeEarnings = 0;
+  private readonly prestigeBaseReq = 20000;
+  private readonly prestigeReqGrowth = 3;
 
   private readonly materials: readonly Material[] = [
     { name: 'ink', color: '#9e9e9e', solid: true, width: 12, alpha: 1 },
+    { name: 'bouncy ink', color: '#4ade80', solid: true, width: 12, alpha: 1, solidColor: '#ff3030', cost: 5000 },
   ];
+  private unlockedMaterials: string[] = [];
   private material = 0;
 
   private readonly objectTools: ReadonlyArray<{ id: ObjectTool; name: string }> = [
@@ -189,6 +200,7 @@ export class Game {
     { id: 'fan', name: 'Fan' },
     { id: 'producer', name: 'Producer' },
     { id: 'destroyer', name: 'Extra Bouncer' },
+    { id: 'bank', name: 'Blood Bank' },
   ];
   private objectMode: ObjectTool = 'pen';
   private objectsOpen = false;
@@ -223,11 +235,29 @@ export class Game {
   private readonly producerCountGrowth = 2.2;
   private readonly producerTrailBase = 300;
   private readonly producerTrailGrowth = 1.9;
+  private readonly producerColorBase = 200;
+  private readonly producerColorGrowth = 1.9;
   private readonly producers: Producer[] = [];
   private producerDrag: { x: number; y: number } | null = null;
   private draggedProducer: Producer | null = null;
   private selectedProducer: Producer | null = null;
   private hoveredProducerIndex = -1;
+
+  private readonly bankW = 44;
+  private readonly bankH = 48;
+  private readonly bankCost = 10000;
+  private readonly bankValueUpBase = 12000;
+  private readonly bankValueUpGrowth = 1.9;
+  private readonly bankCapUpBase = 15000;
+  private readonly bankCapUpGrowth = 1.9;
+  private readonly bankAutoUpBase = 20000;
+  private readonly bankAutoUpGrowth = 1.9;
+  private readonly banks: Bank[] = [];
+  private bankDrag: { x: number; y: number } | null = null;
+  private draggedBank: Bank | null = null;
+  private selectedBank: Bank | null = null;
+  private hoveredBankIndex = -1;
+  private bankAutoTimer = 5;
 
   private readonly upgrades: readonly Upgrade[] = [
     { id: 'cash', name: 'Cash Boost', desc: '+$5 per death', baseCost: 50, growth: 1.9, maxLevel: Infinity, level: 0 },
@@ -241,7 +271,6 @@ export class Game {
   private readonly particles: Particle[] = [];
   private readonly rings: Ring[] = [];
   private readonly splats: Splat[] = [];
-  private readonly worldStains: WorldStain[] = [];
 
   private deviceScale = 1;
 
@@ -268,7 +297,6 @@ export class Game {
   private dragged: Body | null = null;
   private storedVx = 0;
   private storedVy = 0;
-  private tearTimer = 2;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -302,6 +330,7 @@ export class Game {
     this.resize();
     this.bouncer.y = Math.round(this.worldH / 2 - this.blockSize / 2);
     this.bouncer.x = Math.round(this.worldW / 2 - this.blockSize / 2);
+    this.bouncer.color = this.hslToHex(Math.random() * 360, 0.65 + Math.random() * 0.3, 0.45 + Math.random() * 0.2);
     this.mouseX = this.canvas.width / 2;
     this.mouseY = this.canvas.height / 2;
     this.createProducer(Math.round(this.worldW / 2 - this.producerW / 2), 8);
@@ -335,7 +364,6 @@ export class Game {
       this.solidCtx.clearRect(0, 0, this.solidLayer.width, this.solidLayer.height);
       this.bloodCtx.clearRect(0, 0, this.bloodLayer.width, this.bloodLayer.height);
       this.splats.length = 0;
-      this.worldStains.length = 0;
       this.inkEpoch++;
       this.markInkDirty();
     } else if (key === 'e') {
@@ -376,16 +404,20 @@ export class Game {
     if (!raw) return;
     let data: {
       money?: number;
+      prestigeLevel?: number;
+      lifetimeEarnings?: number;
+      unlockedMaterials?: string[];
       upgrades?: Record<string, number>;
       bloodDuration?: number;
       bloodAmount?: number;
       soundVolume?: number;
       ink?: { layer?: string; solid?: string; blood?: string };
       droppers?: DropperSave[];
-      bouncer?: { x: number; y: number };
-      extraBouncers?: { x: number; y: number }[];
+      bouncer?: { x: number; y: number; color?: string; kills?: number };
+      extraBouncers?: { x: number; y: number; color?: string; kills?: number }[];
       fans?: { x: number; y: number; dirX: number; dirY: number; powerLv?: number; reachLv?: number }[];
       producers?: ProducerSave[];
+      banks?: BankSave[];
     };
     try {
       data = JSON.parse(raw);
@@ -394,6 +426,16 @@ export class Game {
     }
     if (typeof data.money === 'number') {
       this.money = data.money;
+    }
+    if (typeof data.prestigeLevel === 'number') {
+      this.prestigeLevel = Math.max(0, Math.floor(data.prestigeLevel));
+    }
+    if (typeof data.lifetimeEarnings === 'number') {
+      this.lifetimeEarnings = Math.max(0, data.lifetimeEarnings);
+    }
+    if (Array.isArray(data.unlockedMaterials)) {
+      const valid = new Set(this.materials.filter((m) => m.cost).map((m) => m.name));
+      this.unlockedMaterials = data.unlockedMaterials.filter((n): n is string => typeof n === 'string' && valid.has(n));
     }
     if (data.upgrades) {
       for (const up of this.upgrades) {
@@ -418,6 +460,7 @@ export class Game {
           speedLv: typeof sp.speedLv === 'number' && sp.speedLv >= 0 ? Math.floor(sp.speedLv) : 0,
           countLv: typeof sp.countLv === 'number' && sp.countLv >= 0 ? Math.floor(sp.countLv) : 0,
           trailLv: typeof sp.trailLv === 'number' && sp.trailLv >= 0 ? Math.floor(sp.trailLv) : 0,
+          colorLv: typeof sp.colorLv === 'number' && sp.colorLv >= 0 ? Math.floor(sp.colorLv) : 0,
         });
       }
     }
@@ -460,6 +503,12 @@ export class Game {
     if (data.bouncer && typeof data.bouncer.x === 'number' && typeof data.bouncer.y === 'number') {
       this.bouncer.x = Math.min(Math.max(data.bouncer.x, 0), this.worldW - this.blockSize);
       this.bouncer.y = Math.min(Math.max(data.bouncer.y, this.topMatHeight), this.worldH - this.blockSize);
+      if (typeof data.bouncer.color === 'string' && /^#[0-9a-f]{6}$/i.test(data.bouncer.color)) {
+        this.bouncer.color = data.bouncer.color;
+      }
+      if (typeof data.bouncer.kills === 'number') {
+        this.bouncer.kills = Math.max(0, Math.floor(data.bouncer.kills));
+      }
     }
     const savedExtra = data.extraBouncers ?? [];
     for (const se of savedExtra) {
@@ -467,6 +516,12 @@ export class Game {
       const b = this.createExtraBouncer();
       b.x = Math.min(Math.max(se.x, 0), this.worldW - this.blockSize);
       b.y = Math.min(Math.max(se.y, this.topMatHeight), this.worldH - this.blockSize);
+      if (typeof se.color === 'string' && /^#[0-9a-f]{6}$/i.test(se.color)) {
+        b.color = se.color;
+      }
+      if (typeof se.kills === 'number') {
+        b.kills = Math.max(0, Math.floor(se.kills));
+      }
       this.extraBouncers.push(b);
     }
     const savedFans = data.fans ?? [];
@@ -491,6 +546,19 @@ export class Game {
         reachLv: typeof sf.reachLv === 'number' ? sf.reachLv : 0,
       });
     }
+    const savedBanks = data.banks ?? [];
+    for (const sb of savedBanks) {
+      if (typeof sb.x !== 'number' || typeof sb.y !== 'number') continue;
+      const pos = this.clampBankPos(sb.x, sb.y);
+      this.banks.push({
+        x: pos.x,
+        y: pos.y,
+        money: typeof sb.money === 'number' ? Math.max(0, sb.money) : 0,
+        valueLv: typeof sb.valueLv === 'number' && sb.valueLv >= 0 ? Math.floor(sb.valueLv) : 0,
+        capLv: typeof sb.capLv === 'number' && sb.capLv >= 0 ? Math.floor(sb.capLv) : 0,
+        autoLv: typeof sb.autoLv === 'number' && sb.autoLv >= 0 ? Math.floor(sb.autoLv) : 0,
+      });
+    }
   }
 
   private restoreLayer(canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D, dataUrl?: string): void {
@@ -507,18 +575,25 @@ export class Game {
 
   private progressData(): {
     money: number;
+    prestigeLevel: number;
+    lifetimeEarnings: number;
+    unlockedMaterials: string[];
     upgrades: Record<string, number>;
     bloodDuration: number;
     bloodAmount: number;
     soundVolume: number;
     droppers: DropperSave[];
-    bouncer: { x: number; y: number };
-    extraBouncers: { x: number; y: number }[];
+    bouncer: { x: number; y: number; color?: string; kills?: number };
+    extraBouncers: { x: number; y: number; color?: string; kills?: number }[];
     fans: { x: number; y: number; dirX: number; dirY: number; powerLv: number; reachLv: number }[];
     producers: ProducerSave[];
+    banks: BankSave[];
   } {
     return {
       money: this.money,
+      prestigeLevel: this.prestigeLevel,
+      lifetimeEarnings: this.lifetimeEarnings,
+      unlockedMaterials: this.unlockedMaterials,
       upgrades: Object.fromEntries(this.upgrades.map((u) => [u.id, u.level])),
       bloodDuration: this.bloodDuration,
       bloodAmount: this.bloodAmount,
@@ -532,10 +607,11 @@ export class Game {
         gold: d.gold,
         producer: d.producer ? this.producers.indexOf(d.producer) : -1,
       })),
-      bouncer: { x: this.bouncer.x, y: this.bouncer.y },
-      extraBouncers: this.extraBouncers.map((b) => ({ x: b.x, y: b.y })),
+      bouncer: { x: this.bouncer.x, y: this.bouncer.y, color: this.bouncer.color, kills: this.bouncer.kills },
+      extraBouncers: this.extraBouncers.map((b) => ({ x: b.x, y: b.y, color: b.color, kills: b.kills })),
       fans: this.fans.map((f) => ({ x: f.x, y: f.y, dirX: f.dirX, dirY: f.dirY, powerLv: f.powerLv, reachLv: f.reachLv })),
-      producers: this.producers.map((p) => ({ x: p.x, y: p.y, speedLv: p.speedLv, countLv: p.countLv, trailLv: p.trailLv })),
+      producers: this.producers.map((p) => ({ x: p.x, y: p.y, speedLv: p.speedLv, countLv: p.countLv, trailLv: p.trailLv, colorLv: p.colorLv })),
+      banks: this.banks.map((b) => ({ x: b.x, y: b.y, money: b.money, valueLv: b.valueLv, capLv: b.capLv, autoLv: b.autoLv })),
     };
   }
 
@@ -811,6 +887,16 @@ export class Game {
           }
           return;
         }
+        const bi = this.hitBankPoint(w.x, w.y);
+        if (bi >= 0) {
+          this.draggedBank = this.banks[bi];
+          try {
+            this.canvas.setPointerCapture(e.pointerId);
+          } catch {
+            // pointer may already be gone
+          }
+          return;
+        }
         this.panActive = true;
         this.panStartX = p.x;
         this.panStartY = p.y;
@@ -849,6 +935,10 @@ export class Game {
     }
     if (this.hitResetButton(p.x, p.y)) {
       this.resetAll();
+      return;
+    }
+    if (this.hitPrestigeButton(p.x, p.y)) {
+      this.doPrestige();
       return;
     }
     if (this.hitSettingsButton(p.x, p.y)) {
@@ -892,6 +982,17 @@ export class Game {
       this.freePlace = false;
       return;
     }
+    const matRow = this.hitMaterialRow(p.x, p.y);
+    if (matRow >= 0) {
+      const mat = this.materials[matRow];
+      if (this.materialUnlocked(mat)) {
+        this.material = matRow;
+        this.sfx.buy();
+      } else {
+        this.tryUnlockMaterial(mat);
+      }
+      return;
+    }
     if (this.hitSecretButton(p.x, p.y)) {
       this.secretOpen = !this.secretOpen;
       if (this.secretOpen) {
@@ -914,7 +1015,7 @@ export class Game {
       this.selectedProducer = null;
       return;
     }
-    if (menuHit === 'speed' || menuHit === 'count' || menuHit === 'trail') {
+    if (menuHit === 'speed' || menuHit === 'count' || menuHit === 'trail' || menuHit === 'color') {
       this.tryBuyProducerUpgrade(menuHit);
       return;
     }
@@ -929,6 +1030,20 @@ export class Game {
       return;
     }
 
+    const bankMenuHit = this.hitBankMenu(p.x, p.y);
+    if (bankMenuHit === 'close') {
+      this.selectedBank = null;
+      return;
+    }
+    if (bankMenuHit === 'cash') {
+      this.cashOutBank();
+      return;
+    }
+    if (bankMenuHit === 'value' || bankMenuHit === 'cap' || bankMenuHit === 'auto') {
+      this.tryBuyBankUpgrade(bankMenuHit);
+      return;
+    }
+
     this.drawX = w.x;
     this.drawY = w.y;
 
@@ -936,6 +1051,7 @@ export class Game {
       this.removeFansNear(w.x, w.y);
       this.removeProducersNear(w.x, w.y);
       this.removeExtraBouncersNear(w.x, w.y);
+      this.removeBanksNear(w.x, w.y);
       this.drawing = true;
       this.inkEpoch++;
       try {
@@ -953,16 +1069,36 @@ export class Game {
       if (fi >= 0) {
         this.selectedFan = this.selectedFan === this.fans[fi] ? null : this.fans[fi];
         this.selectedProducer = null;
+        this.selectedBank = null;
         return;
       }
       const pi = this.hitProducerPoint(w.x, w.y);
       if (pi >= 0) {
         this.selectedProducer = this.selectedProducer === this.producers[pi] ? null : this.producers[pi];
         this.selectedFan = null;
+        this.selectedBank = null;
+        return;
+      }
+      const bi = this.hitBankPoint(w.x, w.y);
+      if (bi >= 0) {
+        this.selectedBank = this.selectedBank === this.banks[bi] ? null : this.banks[bi];
+        this.selectedProducer = null;
+        this.selectedFan = null;
         return;
       }
       this.selectedProducer = null;
       this.selectedFan = null;
+      this.selectedBank = null;
+    }
+
+    if (this.objectMode === 'bank') {
+      this.bankDrag = { x: w.x, y: w.y };
+      try {
+        this.canvas.setPointerCapture(e.pointerId);
+      } catch {
+        // pointer may already be gone
+      }
+      return;
     }
 
     if (this.objectMode === 'producer') {
@@ -1022,7 +1158,7 @@ export class Game {
       solidCtx.lineWidth = this.drawWidth;
       solidCtx.lineCap = 'round';
       solidCtx.lineJoin = 'round';
-      solidCtx.fillStyle = '#000000';
+      solidCtx.fillStyle = mat.solidColor ?? '#000000';
       solidCtx.beginPath();
       solidCtx.arc(w.x, w.y, pen, 0, Math.PI * 2);
       solidCtx.fill();
@@ -1042,6 +1178,7 @@ export class Game {
     if (this.fanDrag) return;
     if (this.producerDrag) return;
     if (this.bouncerDrag) return;
+    if (this.bankDrag) return;
     if (this.draggedFan) {
       const w = this.toWorldPoint(e);
       const s = this.fanSize;
@@ -1054,6 +1191,13 @@ export class Game {
       const pos = this.clampProducerPos(w.x - this.producerW / 2, w.y - this.producerH / 2);
       this.draggedProducer.x = pos.x;
       this.draggedProducer.y = pos.y;
+      return;
+    }
+    if (this.draggedBank) {
+      const w = this.toWorldPoint(e);
+      const pos = this.clampBankPos(w.x - this.bankW / 2, w.y - this.bankH / 2);
+      this.draggedBank.x = pos.x;
+      this.draggedBank.y = pos.y;
       return;
     }
     if (!this.drawing && !this.dragged) return;
@@ -1071,6 +1215,7 @@ export class Game {
       this.removeFansAlong(this.drawX, this.drawY, w.x, w.y);
       this.removeProducersAlong(this.drawX, this.drawY, w.x, w.y);
       this.removeExtraBouncersAlong(this.drawX, this.drawY, w.x, w.y);
+      this.removeBanksAlong(this.drawX, this.drawY, w.x, w.y);
       this.eraseAt(this.drawX, this.drawY, w.x, w.y);
       this.drawX = w.x;
       this.drawY = w.y;
@@ -1094,7 +1239,7 @@ export class Game {
       solidCtx.lineWidth = this.drawWidth;
       solidCtx.lineCap = 'round';
       solidCtx.lineJoin = 'round';
-      solidCtx.strokeStyle = '#000000';
+      solidCtx.strokeStyle = mat.solidColor ?? '#000000';
       solidCtx.beginPath();
       solidCtx.moveTo(this.drawX, this.drawY);
       solidCtx.lineTo(w.x, w.y);
@@ -1147,6 +1292,13 @@ export class Game {
       this.bouncerDrag = null;
       return;
     }
+    if (this.bankDrag) {
+      if (this.placeBank(this.bankDrag.x, this.bankDrag.y)) {
+        this.objectMode = 'pen';
+      }
+      this.bankDrag = null;
+      return;
+    }
     if (e.button === 2) {
       if (this.dragged) {
         this.dragged.vx = this.storedVx;
@@ -1160,6 +1312,10 @@ export class Game {
       if (this.draggedProducer) {
         this.markSaveDirty();
         this.draggedProducer = null;
+      }
+      if (this.draggedBank) {
+        this.markSaveDirty();
+        this.draggedBank = null;
       }
       this.panActive = false;
       return;
@@ -1176,11 +1332,23 @@ export class Game {
     if (x < 0 || y < 0 || x + s > this.worldW || (y + s > this.worldH && !passFloor)) {
       return false;
     }
+    if (this.bankAtRect(x, y, s, s)) {
+      return false;
+    }
     const data = this.solidCtx.getImageData(Math.round(x), Math.round(y), s, s).data;
     for (let i = 3; i < data.length; i += 4) {
       if (data[i] !== 0) return false;
     }
     return true;
+  }
+
+  private bankAtRect(x: number, y: number, w: number, h: number): boolean {
+    for (const b of this.banks) {
+      if (x < b.x + this.bankW && x + w > b.x && y < b.y + this.bankH && y + h > b.y) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private countDrawn(x0: number, y0: number, w: number, h: number): number {
@@ -1230,19 +1398,26 @@ export class Game {
     if (!blockedY) body.y += dy;
 
     let ink = false;
+    let bouncy = false;
     let approach = 0;
     if (blockedY && this.inkAtRect(body.x, body.y + dy)) {
       ink = true;
       approach = Math.max(approach, Math.abs(body.vy));
+      if (this.bouncyAt(body.x, body.y + dy)) {
+        bouncy = true;
+      }
     }
     if (blockedX && this.inkAtRect(body.x + dx, body.y)) {
       ink = true;
       approach = Math.max(approach, Math.abs(body.vx));
+      if (this.bouncyAt(body.x + dx, body.y)) {
+        bouncy = true;
+      }
     }
     const inkBlockedX = blockedX && this.inkAtRect(body.x + dx, body.y);
     const inkBlockedY = blockedY && this.inkAtRect(body.x, body.y + dy);
 
-    if (!blockedX && !blockedY) return { approach, ink };
+    if (!blockedX && !blockedY) return { approach, ink, bouncy };
 
     const nx0 = body.x + dx;
     const ny0 = body.y + dy;
@@ -1281,10 +1456,12 @@ export class Game {
       ny += pn.y;
     }
 
+    const res = bouncy ? 1 : restitution;
+
     if (nx === 0 && ny === 0) {
-      if (blockedX) body.vx = -body.vx * restitution;
-      if (blockedY) body.vy = -body.vy * restitution;
-      return { approach, ink };
+      if (blockedX) body.vx = -body.vx * res;
+      if (blockedY) body.vy = -body.vy * res;
+      return { approach, ink, bouncy };
     }
 
     const len = Math.hypot(nx, ny);
@@ -1292,17 +1469,17 @@ export class Game {
     ny /= len;
 
     const vn = body.vx * nx + body.vy * ny;
-    if (vn >= 0) return { approach, ink };
+    if (vn >= 0) return { approach, ink, bouncy };
 
     approach = Math.max(approach, -vn);
     if (approach >= settle) {
-      body.vx -= (1 + restitution) * vn * nx;
-      body.vy -= (1 + restitution) * vn * ny;
+      body.vx -= (1 + res) * vn * nx;
+      body.vy -= (1 + res) * vn * ny;
       if ((wallX || wallY) && approach >= 60 && this.borderSoundTimer <= 0) {
         this.sfx.border(Math.min(approach, 800));
         this.borderSoundTimer = 0.12;
       }
-      return { approach, ink };
+      return { approach, ink, bouncy };
     }
 
     body.vx -= vn * nx;
@@ -1315,7 +1492,7 @@ if (settle > 0) {
         if (Math.hypot(body.vx, body.vy) < this.frictionStop) {
           body.vx = 0;
           body.vy = 0;
-          return { approach, ink };
+          return { approach, ink, bouncy };
         }
       }
 
@@ -1335,7 +1512,7 @@ if (settle > 0) {
         body.vy *= this.maxFall / speed;
       }
     }
-    return { approach, ink };
+    return { approach, ink, bouncy };
   }
 
   private resolveOverlap(body: Body): void {
@@ -1361,28 +1538,11 @@ if (settle > 0) {
     }
   }
 
-  private updateBouncer(dt: number): void {
-    this.tearTimer -= dt;
-    if (this.tearTimer <= 0) {
-      this.tearTimer = 3.5 + Math.random() * 2.5;
-      this.particles.push({
-        x: this.bouncer.x + this.blockSize * 0.62,
-        y: this.bouncer.y + this.blockSize * 0.4,
-        vx: 0,
-        vy: 70,
-        life: 1.4,
-        maxLife: 1.4,
-        size: 2.5,
-        color: '#8ab8e8',
-      });
-    }
-  }
-
   private updateDropper(d: Dropper, dt: number): void {
     d.vy = Math.min(d.vy + this.gravity * dt, this.maxFall);
     const impact = this.stepBody(d, dt, this.bounciness, this.settleSpeed);
     if (impact.approach >= this.settleSpeed && impact.ink) {
-      d.bounceBonus += 5;
+      d.bounceBonus += impact.bouncy ? 12 : 5;
       if (this.bounceSoundTimer <= 0) {
         this.sfx.bounce(Math.min(impact.approach, 600));
         this.bounceSoundTimer = 0.1;
@@ -1409,9 +1569,29 @@ if (settle > 0) {
           if (this.dragged === d) {
             this.dragged = null;
           }
+          b.kills = (b.kills ?? 0) + 1;
+          if (b.kills % 5 === 0) {
+            this.recolorBouncer(b);
+          }
         }
       }
     }
+  }
+
+  private recolorBouncer(b: Body): void {
+    b.color = this.hslToHex(Math.random() * 360, 0.65 + Math.random() * 0.3, 0.45 + Math.random() * 0.2);
+    if (this.rings.length > 8) {
+      this.rings.shift();
+    }
+    this.rings.push({
+      x: b.x + this.blockSize / 2,
+      y: b.y + this.blockSize / 2,
+      maxR: 44,
+      born: this.time,
+      life: 0.6,
+      color: b.color,
+      width: 4,
+    });
   }
 
   private checkStuckDroppers(dt: number): void {
@@ -1450,9 +1630,23 @@ if (settle > 0) {
         gain *= 2;
       }
     }
+    gain = Math.round(gain * this.prestigeMultiplier());
     this.money += gain;
+    this.lifetimeEarnings += gain;
     d.bounceBonus = 0;
     this.markSaveDirty();
+  }
+
+  private prestigeRequirement(): number {
+    return Math.round(this.prestigeBaseReq * Math.pow(this.prestigeReqGrowth, this.prestigeLevel));
+  }
+
+  private prestigeReady(): boolean {
+    return this.lifetimeEarnings >= this.prestigeRequirement();
+  }
+
+  private prestigeMultiplier(): number {
+    return 1 + this.prestigeLevel;
   }
 
   private upgradeCost(i: number): number {
@@ -1531,13 +1725,26 @@ if (settle > 0) {
     return { x: 12, y: 46, w: 264, rowH: 34, gap: 6, pad: 8 };
   }
 
-  private settingsButtonsGeom(): { btnH: number; btnW: number; btnY: number; resetBtnY: number } {
+  private settingsButtonsGeom(): { btnH: number; btnW: number; btnY: number; resetBtnY: number; prestigeBtnY: number } {
     const p = this.settingsPanel();
     const rows = 3;
     const ctlTop = p.y + p.pad + rows * p.rowH + (rows - 1) * p.gap + 12;
     const btnH = 28;
     const btnW = p.w - p.pad * 2;
-    return { btnH, btnW, btnY: ctlTop + 6, resetBtnY: ctlTop + 6 + btnH + 8 };
+    return {
+      btnH,
+      btnW,
+      btnY: ctlTop + 6,
+      resetBtnY: ctlTop + 6 + btnH + 8,
+      prestigeBtnY: ctlTop + 6 + (btnH + 8) * 2,
+    };
+  }
+
+  private hitPrestigeButton(px: number, py: number): boolean {
+    if (!this.settingsOpen) return false;
+    const p = this.settingsPanel();
+    const g = this.settingsButtonsGeom();
+    return px >= p.x + p.pad && px <= p.x + p.pad + g.btnW && py >= g.prestigeBtnY && py <= g.prestigeBtnY + g.btnH;
   }
 
   private hitSettingsControl(px: number, py: number): { row: number; btn: 'minus' | 'plus' } | null {
@@ -1592,11 +1799,10 @@ if (settle > 0) {
   private clearBlood(): void {
     this.bloodCtx.clearRect(0, 0, this.bloodLayer.width, this.bloodLayer.height);
     this.splats.length = 0;
-    this.worldStains.length = 0;
     this.markSaveDirty();
   }
 
-  private resetAll(): void {
+  private resetWorld(): void {
     this.money = 0;
     this.rewardPerDeath = 5;
     for (const up of this.upgrades) {
@@ -1606,7 +1812,6 @@ if (settle > 0) {
     this.solidCtx.clearRect(0, 0, this.solidLayer.width, this.solidLayer.height);
     this.bloodCtx.clearRect(0, 0, this.bloodLayer.width, this.bloodLayer.height);
     this.splats.length = 0;
-    this.worldStains.length = 0;
     this.particles.length = 0;
     this.rings.length = 0;
     this.shake = 0;
@@ -1614,17 +1819,29 @@ if (settle > 0) {
     this.extraBouncers.length = 0;
     this.fans.length = 0;
     this.producers.length = 0;
+    this.banks.length = 0;
     this.fanDrag = null;
     this.draggedFan = null;
     this.producerDrag = null;
     this.draggedProducer = null;
     this.selectedProducer = null;
     this.selectedFan = null;
+    this.bankDrag = null;
+    this.draggedBank = null;
+    this.selectedBank = null;
     this.secretOpen = false;
     this.freePlace = false;
+    this.material = 0;
+    this.unlockedMaterials.length = 0;
     this.applyWorldSize();
     this.createProducer(Math.round(this.worldW / 2 - this.producerW / 2), 8);
     this.centerCamera();
+  }
+
+  private resetAll(): void {
+    this.resetWorld();
+    this.prestigeLevel = 0;
+    this.lifetimeEarnings = 0;
     try {
       localStorage.removeItem(this.saveKey);
     } catch {
@@ -1632,6 +1849,19 @@ if (settle > 0) {
     }
     this.saveDirty = false;
     this.inkDirty = false;
+  }
+
+  private doPrestige(): void {
+    if (!this.prestigeReady()) {
+      this.sfx.deny();
+      return;
+    }
+    this.resetWorld();
+    this.prestigeLevel++;
+    this.lifetimeEarnings = 0;
+    this.inkEpoch++;
+    this.markInkDirty();
+    this.sfx.buy();
   }
 
   private tryBuyUpgrade(i: number): void {
@@ -1684,9 +1914,10 @@ if (settle > 0) {
     const btnY = g.btnY;
     const btnW = g.btnW;
     const resetBtnY = g.resetBtnY;
+    const prestigeBtnY = g.prestigeBtnY;
     const ctlHeaderH = 18;
     const ctlLineH = 17;
-    const ctlTop2 = resetBtnY + btnH + 10;
+    const ctlTop2 = prestigeBtnY + btnH + 10;
     const panelH = ctlTop2 + ctlHeaderH + controls.length * ctlLineH + p.pad;
     ctx.fillStyle = 'rgba(30, 30, 30, 0.9)';
     ctx.fillRect(p.x, p.y, p.w, panelH);
@@ -1732,6 +1963,21 @@ if (settle > 0) {
     ctx.fillStyle = '#ffffff';
     ctx.textAlign = 'center';
     ctx.fillText('Reset All Progress', p.x + p.w / 2, resetBtnY + btnH / 2 + 4);
+    const prestReady = this.prestigeReady();
+    ctx.fillStyle = prestReady ? 'rgba(88, 150, 66, 0.9)' : 'rgba(110, 110, 110, 0.85)';
+    ctx.fillRect(p.x + p.pad, prestigeBtnY, btnW, btnH);
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+    ctx.strokeRect(p.x + p.pad, prestigeBtnY, btnW, btnH);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '13px system-ui, sans-serif';
+    ctx.fillText(`Prestige  Lv ${this.prestigeLevel}`, p.x + p.w / 2, prestigeBtnY + 13);
+    ctx.font = '10px system-ui, sans-serif';
+    ctx.fillStyle = prestReady ? '#d8ffc8' : 'rgba(255, 255, 255, 0.7)';
+    ctx.fillText(
+      prestReady ? `READY — next: x${2 + this.prestigeLevel} earnings` : `earn $${this.prestigeRequirement()} to unlock`,
+      p.x + p.w / 2,
+      prestigeBtnY + 24,
+    );
     ctx.textAlign = 'left';
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
     ctx.beginPath();
@@ -1832,23 +2078,6 @@ if (settle > 0) {
     return { x: ux / len, y: uy / len };
   }
 
-  private addWorldStain(x: number, y: number, size: number, color: string, alpha: number): void {
-    const count = 1 + Math.floor(Math.random() * 3);
-    for (let i = 0; i < count; i++) {
-      if (this.worldStains.length >= 500) {
-        this.worldStains.shift();
-      }
-      this.worldStains.push({
-        x: x + (Math.random() - 0.5) * size * 1.5,
-        y: y + (Math.random() - 0.5) * size,
-        size: size * (0.4 + Math.random() * 0.8),
-        color,
-        alpha: alpha * (0.6 + Math.random() * 0.5),
-        born: this.time,
-      });
-    }
-  }
-
   private shadeColor(hex: string, factor: number): string {
     const n = parseInt(hex.slice(1), 16);
     const r0 = (n >> 16) & 255;
@@ -1899,12 +2128,23 @@ private hslToHex(h: number, s: number, l: number): string {
     return `#${((to255(r) << 16) | (to255(g) << 8) | to255(b)).toString(16).padStart(6, '0')}`;
   }
 
-  private nextDropperColor(): string {
+  private dropperColor(p: Producer): string {
+    if (p.colorLv <= 0) {
+      return '#4a4a4a';
+    }
     let color: string;
     do {
       color = this.hslToHex(Math.random() * 360, 0.65 + Math.random() * 0.3, 0.45 + Math.random() * 0.2);
-    } while (this.droppers.some((d) => d.color === color));
+    } while (this.droppers.some((d) => d.producer === p && d.color === color));
     return color;
+  }
+
+  private applyProducerColors(p: Producer): void {
+    for (const d of this.droppers) {
+      if (d.producer === p && !d.gold) {
+        d.color = this.dropperColor(p);
+      }
+    }
   }
 
   private goldChance(): number {
@@ -2030,15 +2270,15 @@ private hslToHex(h: number, s: number, l: number): string {
       spawnVy: v.vy,
       bounceBonus: 0,
       stuckTimer: 0,
-      color: spawn?.color ?? this.nextDropperColor(),
+      color: spawn?.color ?? this.dropperColor(producer),
       gold,
       producer,
       trailPts: [],
     };
   }
 
-  private createProducer(x: number, y: number, speedLv = 0, countLv = 0, trailLv = 0): Producer {
-    const p: Producer = { x, y, speedLv, countLv, trailLv };
+  private createProducer(x: number, y: number, speedLv = 0, countLv = 0, trailLv = 0, colorLv = 0): Producer {
+    const p: Producer = { x, y, speedLv, countLv, trailLv, colorLv };
     this.producers.push(p);
     const want = 1 + countLv;
     for (let i = 0; i < want; i++) {
@@ -2058,6 +2298,7 @@ private hslToHex(h: number, s: number, l: number): string {
       y: Math.round(this.topMatHeight + Math.random() * Math.max(0, this.worldH - this.topMatHeight - s)),
       vx: 0,
       vy: 0,
+      color: this.hslToHex(Math.random() * 360, 0.65 + Math.random() * 0.3, 0.45 + Math.random() * 0.2),
     };
   }
 
@@ -2150,38 +2391,24 @@ private hslToHex(h: number, s: number, l: number): string {
 
     const blobs = Math.round((16 + Math.floor(Math.random() * 10)) * amount);
     for (let i = 0; i < blobs; i++) {
-      const forward = reach * (Math.random() * 1.3 - 0.25);
-      const side = (Math.random() - 0.5) * 24;
+      const forward = reach * (Math.random() * 1.1 - 0.2);
+      const side = (Math.random() - 0.5) * 88;
       const x = cx + dirX * forward + px * side;
       const y = cy + dirY * forward + py * side;
       const size = 2 + Math.random() * 7;
       const alpha = 0.45 + Math.random() * 0.4;
       const c = colors[Math.floor(Math.random() * colors.length)];
-      if (Math.random() < 0.3) {
-        this.splats.push({
-          kind: 'drip',
-          born: this.time,
-          x,
-          y,
-          width: size,
-          color: c,
-          alpha,
-          speed: 18 + Math.random() * 22,
-          vy: 0,
-          contact: false,
-          startY: y,
-        });
-      } else {
-        this.splats.push({
-          kind: 'blob',
-          born: this.time,
-          x,
-          y,
-          size,
-          color: c,
-          alpha,
-        });
-      }
+      this.splats.push({
+        kind: 'blob',
+        born: this.time,
+        x,
+        y,
+        size,
+        color: c,
+        alpha,
+        rot: Math.random() * Math.PI * 2,
+      });
+      this.depositSplat(x, y);
     }
 
     const baseAngle = Math.atan2(dirY, dirX);
@@ -2205,42 +2432,29 @@ private hslToHex(h: number, s: number, l: number): string {
         angle,
         color: c,
         alpha,
+        skew: (Math.random() - 0.5) * 0.8,
       });
+      this.depositSplat(sx, sy);
     }
   }
 
-  private hasSupport(x: number, y: number, w: number): boolean {
-    const ix = Math.round(x);
-    const iw = Math.max(1, Math.round(w));
-    const iy = Math.round(y) + Math.round(w);
-    if (iy >= this.worldH - 1) return false;
-    return this.countDrawn(ix - Math.floor(iw / 2), iy, iw + 1, 2) > 0;
+  private bankValuePerSplat(b: Bank): number {
+    return 5 + 2 * b.valueLv;
   }
 
-  private updateSplats(dt: number): void {
-    for (const s of this.splats) {
-      if (s.kind !== 'drip') continue;
-      const w = s.width;
-      if (s.contact) {
-        if (s.y + w >= this.worldH - 1) continue;
-        if (this.hasSupport(s.x, s.y, w)) {
-          s.y += s.speed * dt;
-        } else {
-          s.contact = false;
-        }
-        if (Math.random() < dt * 5) {
-          this.addWorldStain(s.x - w / 2, s.y + w, w * (0.6 + Math.random() * 0.6), s.color, 0.45 + Math.random() * 0.25);
-        }
-      } else {
-        s.vy = Math.min(s.vy + this.gravity * 0.6 * dt, 800);
-        s.y += s.vy * dt;
-        if (s.y + w >= this.worldH - 1 || this.hasSupport(s.x, s.y, w)) {
-          s.contact = true;
-          s.startY = s.y;
-          s.vy = 0;
-          this.addWorldStain(s.x - w / 2, s.y + w, w, s.color, 0.55);
-        }
-      }
+  private bankCapacity(b: Bank): number {
+    return Math.round(1000 * Math.pow(1.9, b.capLv));
+  }
+
+  private depositSplat(x: number, y: number): void {
+    for (const b of this.banks) {
+      if (x < b.x || x > b.x + this.bankW || y < b.y || y > b.y + this.bankH) continue;
+      const cap = this.bankCapacity(b);
+      const add = Math.min(this.bankValuePerSplat(b), Math.max(0, cap - b.money));
+      if (add <= 0) return;
+      b.money += add;
+      this.markSaveDirty();
+      return;
     }
   }
 
@@ -2250,7 +2464,7 @@ private hslToHex(h: number, s: number, l: number): string {
     const cx = b.x + s / 2;
     const cy = b.y + s / 2;
     const r = s / 2;
-    const base = isMain ? '#4a90e2' : '#63b3ed';
+    const base = b.color ?? (isMain ? '#4a90e2' : '#63b3ed');
     const pulse = (Math.sin(this.time * 5 + (isMain ? 0 : 1.7)) + 1) / 2;
     ctx.strokeStyle = base;
     ctx.lineWidth = 2.5;
@@ -2258,9 +2472,9 @@ private hslToHex(h: number, s: number, l: number): string {
     ctx.arc(cx, cy, r + 3 + pulse * 6, 0, Math.PI * 2);
     ctx.stroke();
     const grad = ctx.createRadialGradient(cx - r * 0.35, cy - r * 0.35, r * 0.15, cx, cy, r);
-    grad.addColorStop(0, '#b8dcff');
+    grad.addColorStop(0, b.color ? this.shadeColor(base, 1.4) : '#b8dcff');
     grad.addColorStop(0.55, base);
-    grad.addColorStop(1, '#123f6b');
+    grad.addColorStop(1, b.color ? this.shadeColor(base, 0.35) : '#123f6b');
     ctx.fillStyle = grad;
     ctx.beginPath();
     ctx.arc(cx, cy, r, 0, Math.PI * 2);
@@ -2274,23 +2488,73 @@ private hslToHex(h: number, s: number, l: number): string {
       const age = this.time - s.born;
       if (age < 0 || age >= life) continue;
       const fade = 1 - age / life;
-      ctx.globalAlpha = s.alpha * fade;
+      let alpha = s.alpha * fade;
+      if (s.fadeStart !== undefined) {
+        alpha = Math.min(alpha, s.alpha * (1 - (this.time - s.fadeStart) / 1));
+      }
+      ctx.globalAlpha = Math.max(0, alpha);
       ctx.fillStyle = s.color;
       if (s.kind === 'blob') {
-        ctx.fillRect(s.x - s.size / 2, s.y - s.size / 2, s.size, s.size);
+        ctx.save();
+        ctx.translate(s.x, s.y);
+        ctx.rotate(s.rot);
+        this.drawIsoCube(s.size, s.color);
+        ctx.restore();
       } else if (s.kind === 'streak') {
         ctx.save();
         ctx.translate(s.x, s.y);
         ctx.rotate(s.angle);
-        ctx.fillRect(-s.length / 2, -s.width / 2, s.length, s.width);
+        const hl = s.length / 2;
+        const hw = s.width / 2;
+        ctx.beginPath();
+        ctx.moveTo(-hl, -hw);
+        ctx.lineTo(hl, -hw);
+        ctx.lineTo(hl + s.skew * s.width, hw);
+        ctx.lineTo(-hl + s.skew * s.width, hw);
+        ctx.closePath();
+        ctx.fill();
         ctx.restore();
-      } else if (s.contact) {
-        ctx.fillRect(s.x - s.width / 2, s.startY, s.width, s.y - s.startY + s.width);
-      } else {
-        ctx.fillRect(s.x - s.width / 2, s.y, s.width, s.width);
       }
     }
     ctx.globalAlpha = 1;
+  }
+
+  private drawIsoCube(size: number, color: string): void {
+    const { ctx } = this;
+    const r = size / 2;
+    const w = r * 0.9;
+    const h = r * 0.5;
+    const top: ReadonlyArray<readonly [number, number]> = [
+      [0, -h],
+      [w, -h / 2],
+      [w, h / 2],
+      [0, h],
+      [-w, h / 2],
+      [-w, -h / 2],
+    ];
+    const apex = h * 1.6;
+    ctx.fillStyle = this.shadeColor(color, 1.3);
+    ctx.beginPath();
+    ctx.moveTo(top[0][0], top[0][1]);
+    for (let i = 1; i < top.length; i++) {
+      ctx.lineTo(top[i][0], top[i][1]);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = this.shadeColor(color, 0.75);
+    ctx.beginPath();
+    ctx.moveTo(top[2][0], top[2][1]);
+    ctx.lineTo(top[1][0], top[1][1]);
+    ctx.lineTo(w / 2, apex);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = this.shadeColor(color, 0.5);
+    ctx.beginPath();
+    ctx.moveTo(top[5][0], top[5][1]);
+    ctx.lineTo(top[4][0], top[4][1]);
+    ctx.lineTo(-w / 2, apex);
+    ctx.closePath();
+    ctx.fill();
   }
 
   private respawnDropper(dt: number): void {
@@ -2346,7 +2610,6 @@ private hslToHex(h: number, s: number, l: number): string {
         }
         p.vy = -p.vy * 0.5;
         if (Math.abs(p.vy) < 60) p.vy = 0;
-        this.addWorldStain(p.x - p.size / 2, p.y, p.size * (0.7 + Math.random() * 0.5), p.color, 0.5 + Math.random() * 0.3);
       }
       if (p.y + r >= this.worldH || this.inkAt(p.x, p.y, r)) {
         p.vx *= 0.92;
@@ -2368,6 +2631,21 @@ private hslToHex(h: number, s: number, l: number): string {
 
   private inkAtRect(x: number, y: number): boolean {
     return this.countDrawn(x, y, this.blockSize, this.blockSize) > 0;
+  }
+
+  private bouncyAt(x: number, y: number): boolean {
+    const ix0 = Math.max(0, Math.round(x));
+    const iy0 = Math.max(0, Math.round(y));
+    const w = Math.min(this.blockSize, this.worldW - ix0);
+    const h = Math.min(this.blockSize, this.worldH - iy0);
+    if (w <= 0 || h <= 0) return false;
+    const data = this.solidCtx.getImageData(ix0, iy0, w, h).data;
+    for (let i = 0; i < data.length; i += 4) {
+      if (data[i + 3] !== 0 && data[i] > 120 && data[i] > data[i + 1] * 1.4) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private splatLifetime(): number {
@@ -2399,6 +2677,42 @@ private hslToHex(h: number, s: number, l: number): string {
     return -1;
   }
 
+  private materialsTop(): number {
+    const p = this.objectsPanelGeom();
+    const n = this.objectTools.length;
+    return p.y + p.pad + n * p.rowH + (n - 1) * p.gap + 16;
+  }
+
+  private hitMaterialRow(px: number, py: number): number {
+    if (!this.objectsOpen) return -1;
+    const p = this.objectsPanelGeom();
+    const matTop = this.materialsTop();
+    for (let i = 0; i < this.materials.length; i++) {
+      const ry = matTop + i * (p.rowH + p.gap);
+      if (px >= p.x + p.pad && px <= p.x + p.w - p.pad && py >= ry && py <= ry + p.rowH) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  private materialUnlocked(mat: Material): boolean {
+    return !mat.cost || this.unlockedMaterials.includes(mat.name);
+  }
+
+  private tryUnlockMaterial(mat: Material): void {
+    if (!mat.cost) return;
+    if (this.money < mat.cost) {
+      this.sfx.deny();
+      return;
+    }
+    this.money -= mat.cost;
+    this.unlockedMaterials.push(mat.name);
+    this.material = this.materials.indexOf(mat);
+    this.markSaveDirty();
+    this.sfx.buy();
+  }
+
   private renderObjectsMenu(): void {
     const { ctx } = this;
     const b = this.objectsButton();
@@ -2414,11 +2728,17 @@ private hslToHex(h: number, s: number, l: number): string {
     if (!this.objectsOpen) return;
     const p = this.objectsPanelGeom();
     const n = this.objectTools.length;
-    const panelH = p.pad + n * p.rowH + (n - 1) * p.gap + p.pad;
+    const m = this.materials.length;
+    const matTop = this.materialsTop();
+    const panelH = p.pad + n * p.rowH + (n - 1) * p.gap + 16 + m * p.rowH + (m - 1) * p.gap + p.pad;
     ctx.fillStyle = 'rgba(30, 30, 30, 0.9)';
     ctx.fillRect(p.x, p.y, p.w, panelH);
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
     ctx.strokeRect(p.x, p.y, p.w, panelH);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.45)';
+    ctx.font = '10px system-ui, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('MATERIAL', p.x + p.pad + 2, matTop - 4);
     for (let i = 0; i < n; i++) {
       const tool = this.objectTools[i];
       const ry = p.y + p.pad + i * (p.rowH + p.gap);
@@ -2430,12 +2750,42 @@ private hslToHex(h: number, s: number, l: number): string {
       ctx.textAlign = 'left';
       ctx.fillText(selected ? '> ' : '', p.x + p.pad + 6, ry + p.rowH / 2 + 4.5);
       ctx.fillText(tool.name, p.x + p.pad + 22, ry + p.rowH / 2 + 4.5);
-      if (tool.id === 'fan' || tool.id === 'producer' || tool.id === 'destroyer') {
+      if (tool.id === 'fan' || tool.id === 'producer' || tool.id === 'destroyer' || tool.id === 'bank') {
         ctx.textAlign = 'right';
         const cost =
-          tool.id === 'fan' ? this.fanCost : tool.id === 'producer' ? this.producerCost : this.extraBouncerCost;
+          tool.id === 'fan'
+            ? this.fanCost
+            : tool.id === 'producer'
+              ? this.producerCost
+              : tool.id === 'destroyer'
+                ? this.extraBouncerCost
+                : this.bankCost;
         ctx.fillStyle = this.money >= cost ? 'rgba(255, 255, 255, 0.85)' : 'rgba(255, 80, 80, 0.95)';
         ctx.fillText(`$${cost}`, p.x + p.w - p.pad - 6, ry + p.rowH / 2 + 4.5);
+      }
+    }
+    for (let i = 0; i < m; i++) {
+      const mat = this.materials[i];
+      const ry = matTop + i * (p.rowH + p.gap);
+      const selected = this.material === i;
+      const unlocked = this.materialUnlocked(mat);
+      ctx.fillStyle = selected ? 'rgba(255, 255, 255, 0.14)' : 'rgba(255, 255, 255, 0.04)';
+      ctx.fillRect(p.x + p.pad, ry, p.w - p.pad * 2, p.rowH);
+      ctx.globalAlpha = unlocked ? 1 : 0.35;
+      ctx.fillStyle = mat.color;
+      ctx.fillRect(p.x + p.pad + 8, ry + 6, 14, p.rowH - 12);
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+      ctx.strokeRect(p.x + p.pad + 8, ry + 6, 14, p.rowH - 12);
+      ctx.fillStyle = selected ? '#ffe08a' : '#ffffff';
+      ctx.font = '13px system-ui, sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText(selected ? '> ' : '', p.x + p.pad + 26, ry + p.rowH / 2 + 4.5);
+      ctx.fillText(mat.name, p.x + p.pad + 40, ry + p.rowH / 2 + 4.5);
+      if (!unlocked && mat.cost) {
+        ctx.textAlign = 'right';
+        ctx.fillStyle = this.money >= mat.cost ? 'rgba(255, 255, 255, 0.85)' : 'rgba(255, 80, 80, 0.95)';
+        ctx.fillText(`$${mat.cost}`, p.x + p.w - p.pad - 6, ry + p.rowH / 2 + 4.5);
       }
     }
   }
@@ -2648,7 +2998,9 @@ private hslToHex(h: number, s: number, l: number): string {
     }
     const s = this.blockSize;
     const pos = this.clampExtraBouncerPos(sx - s / 2, sy - s / 2);
-    const b = { x: pos.x, y: pos.y, vx: 0, vy: 0 };
+    const b = this.createExtraBouncer();
+    b.x = pos.x;
+    b.y = pos.y;
     const overlap =
       (b.x < this.bouncer.x + s && b.x + s > this.bouncer.x && b.y < this.bouncer.y + s && b.y + s > this.bouncer.y) ||
       this.extraBouncers.some((e) => b.x < e.x + s && b.x + s > e.x && b.y < e.y + s && b.y + s > e.y);
@@ -2782,6 +3134,132 @@ private hslToHex(h: number, s: number, l: number): string {
     }
   }
 
+  private clampBankPos(x: number, y: number): { x: number; y: number } {
+    return {
+      x: Math.min(Math.max(Math.round(x), 0), Math.max(0, this.worldW - this.bankW)),
+      y: Math.min(Math.max(Math.round(y), 0), Math.max(0, this.worldH - this.bankH)),
+    };
+  }
+
+  private hitBankIndex(x: number, y: number): number {
+    for (let i = 0; i < this.banks.length; i++) {
+      const b = this.banks[i];
+      if (x < b.x + this.bankW && x + this.bankW > b.x && y < b.y + this.bankH && y + this.bankH > b.y) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  private hitBankPoint(px: number, py: number): number {
+    for (let i = 0; i < this.banks.length; i++) {
+      const b = this.banks[i];
+      if (px >= b.x && px < b.x + this.bankW && py >= b.y && py < b.y + this.bankH) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  private placeBank(sx: number, sy: number): boolean {
+    if (!this.freePlace && this.money < this.bankCost) {
+      this.sfx.deny();
+      return false;
+    }
+    const pos = this.clampBankPos(sx - this.bankW / 2, sy - this.bankH / 2);
+    if (this.hitBankIndex(pos.x, pos.y) >= 0) {
+      this.sfx.deny();
+      return false;
+    }
+    if (!this.freePlace) {
+      this.money -= this.bankCost;
+    }
+    this.sfx.buy();
+    this.banks.push({ x: pos.x, y: pos.y, money: 0, valueLv: 0, capLv: 0, autoLv: 0 });
+    this.markSaveDirty();
+    return true;
+  }
+
+  private removeBank(i: number): void {
+    const b = this.banks[i];
+    if (this.draggedBank === b) {
+      this.draggedBank = null;
+    }
+    if (this.selectedBank === b) {
+      this.selectedBank = null;
+    }
+    this.banks.splice(i, 1);
+  }
+
+  private removeBanksNear(x: number, y: number): void {
+    const r = this.fanEraserRadius();
+    let removed = false;
+    for (let i = this.banks.length - 1; i >= 0; i--) {
+      const b = this.banks[i];
+      if (x >= b.x - r && x <= b.x + this.bankW + r && y >= b.y - r && y <= b.y + this.bankH + r) {
+        this.removeBank(i);
+        removed = true;
+      }
+    }
+    if (removed) {
+      this.markSaveDirty();
+    }
+  }
+
+  private removeBanksAlong(x0: number, y0: number, x1: number, y1: number): void {
+    const r = this.fanEraserRadius();
+    const len = Math.hypot(x1 - x0, y1 - y0);
+    const steps = Math.max(1, Math.ceil(len / Math.max(1, r)));
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      this.removeBanksNear(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t);
+    }
+  }
+
+  private bankValueCost(b: Bank): number {
+    return Math.round(this.bankValueUpBase * Math.pow(this.bankValueUpGrowth, b.valueLv));
+  }
+
+  private bankCapCost(b: Bank): number {
+    return Math.round(this.bankCapUpBase * Math.pow(this.bankCapUpGrowth, b.capLv));
+  }
+
+  private bankAutoCost(b: Bank): number {
+    return Math.round(this.bankAutoUpBase * Math.pow(this.bankAutoUpGrowth, b.autoLv));
+  }
+
+  private tryBuyBankUpgrade(kind: 'value' | 'cap' | 'auto'): void {
+    const b = this.selectedBank;
+    if (!b) return;
+    const cost = kind === 'value' ? this.bankValueCost(b) : kind === 'cap' ? this.bankCapCost(b) : this.bankAutoCost(b);
+    if (this.money < cost) {
+      this.sfx.deny();
+      return;
+    }
+    this.money -= cost;
+    if (kind === 'value') {
+      b.valueLv++;
+    } else if (kind === 'cap') {
+      b.capLv++;
+    } else {
+      b.autoLv++;
+    }
+    this.sfx.buy();
+    this.markSaveDirty();
+  }
+
+  private cashOutBank(): void {
+    const b = this.selectedBank;
+    if (!b || b.money <= 0) {
+      this.sfx.deny();
+      return;
+    }
+    this.money += b.money;
+    b.money = 0;
+    this.sfx.buy();
+    this.markSaveDirty();
+  }
+
   private producerSpeedCost(p: Producer): number {
     return Math.round(this.producerSpeedBase * Math.pow(this.producerSpeedGrowth, p.speedLv));
   }
@@ -2794,7 +3272,11 @@ private hslToHex(h: number, s: number, l: number): string {
     return Math.round(this.producerTrailBase * Math.pow(this.producerTrailGrowth, p.trailLv));
   }
 
-  private tryBuyProducerUpgrade(kind: 'speed' | 'count' | 'trail'): void {
+  private producerColorCost(p: Producer): number {
+    return Math.round(this.producerColorBase * Math.pow(this.producerColorGrowth, p.colorLv));
+  }
+
+  private tryBuyProducerUpgrade(kind: 'speed' | 'count' | 'trail' | 'color'): void {
     const p = this.selectedProducer;
     if (!p) return;
     if (kind === 'trail' && p.trailLv >= 2) {
@@ -2802,7 +3284,13 @@ private hslToHex(h: number, s: number, l: number): string {
       return;
     }
     const cost =
-      kind === 'speed' ? this.producerSpeedCost(p) : kind === 'count' ? this.producerCountCost(p) : this.producerTrailCost(p);
+      kind === 'speed'
+        ? this.producerSpeedCost(p)
+        : kind === 'count'
+          ? this.producerCountCost(p)
+          : kind === 'trail'
+            ? this.producerTrailCost(p)
+            : this.producerColorCost(p);
     if (this.money < cost) {
       this.sfx.deny();
       return;
@@ -2813,8 +3301,11 @@ private hslToHex(h: number, s: number, l: number): string {
     } else if (kind === 'count') {
       p.countLv++;
       this.droppers.push(this.createDropper(p));
-    } else {
+    } else if (kind === 'trail') {
       p.trailLv++;
+    } else {
+      p.colorLv++;
+      this.applyProducerColors(p);
     }
     this.sfx.buy();
     this.markSaveDirty();
@@ -2845,7 +3336,7 @@ private hslToHex(h: number, s: number, l: number): string {
     const header = 26;
     return {
       x: Math.round(this.canvas.width / 2 - 170),
-      y: this.canvas.height - (header + 3 * (rowH + 8) + pad) - 12,
+      y: this.canvas.height - (header + 4 * (rowH + 8) + pad) - 12,
       w: 340,
       rowH,
       pad,
@@ -2853,22 +3344,61 @@ private hslToHex(h: number, s: number, l: number): string {
     };
   }
 
-  private hitProducerMenu(px: number, py: number): 'speed' | 'count' | 'trail' | 'close' | null {
+  private hitProducerMenu(px: number, py: number): 'speed' | 'count' | 'trail' | 'color' | 'close' | null {
     const p = this.selectedProducer;
     if (!p) return null;
     const g = this.producerMenuGeom();
-    const panelH = g.header + 3 * (g.rowH + 8) + g.pad;
+    const panelH = g.header + 4 * (g.rowH + 8) + g.pad;
     if (px < g.x || px > g.x + g.w || py < g.y || py > g.y + panelH) return null;
     const closeX = g.x + g.w - g.pad - 26;
     const closeY = g.y + g.pad - 2;
     if (px >= closeX && px <= closeX + 26 && py >= closeY && py <= closeY + 20) return 'close';
     const rowsTop = g.y + g.header;
+    for (let i = 0; i < 4; i++) {
+      const ry = rowsTop + i * (g.rowH + 8);
+      const bx = g.x + g.w - g.pad - 120;
+      const by = ry + (g.rowH - 26) / 2;
+      if (px >= bx && px <= bx + 120 && py >= by && py <= by + 26) {
+        return i === 0 ? 'speed' : i === 1 ? 'count' : i === 2 ? 'trail' : 'color';
+      }
+    }
+    return null;
+  }
+
+  private bankMenuGeom(): { x: number; y: number; w: number; rowH: number; pad: number; header: number; btnH: number } {
+    const rowH = 42;
+    const pad = 10;
+    const header = 26;
+    const btnH = 30;
+    return {
+      x: Math.round(this.canvas.width / 2 - 170),
+      y: this.canvas.height - (header + btnH + 8 + 3 * (rowH + 8) + pad) - 12,
+      w: 340,
+      rowH,
+      pad,
+      header,
+      btnH,
+    };
+  }
+
+  private hitBankMenu(px: number, py: number): 'cash' | 'value' | 'cap' | 'auto' | 'close' | null {
+    const b = this.selectedBank;
+    if (!b) return null;
+    const g = this.bankMenuGeom();
+    const panelH = g.header + g.btnH + 8 + 3 * (g.rowH + 8) + g.pad;
+    if (px < g.x || px > g.x + g.w || py < g.y || py > g.y + panelH) return null;
+    const closeX = g.x + g.w - g.pad - 26;
+    const closeY = g.y + g.pad - 2;
+    if (px >= closeX && px <= closeX + 26 && py >= closeY && py <= closeY + 20) return 'close';
+    const btnY = g.y + g.header + 4;
+    if (px >= g.x + g.pad && px <= g.x + g.w - g.pad && py >= btnY && py <= btnY + g.btnH) return 'cash';
+    const rowsTop = g.y + g.header + g.btnH + 8;
     for (let i = 0; i < 3; i++) {
       const ry = rowsTop + i * (g.rowH + 8);
       const bx = g.x + g.w - g.pad - 120;
       const by = ry + (g.rowH - 26) / 2;
       if (px >= bx && px <= bx + 120 && py >= by && py <= by + 26) {
-        return i === 0 ? 'speed' : i === 1 ? 'count' : 'trail';
+        return i === 0 ? 'value' : i === 1 ? 'cap' : 'auto';
       }
     }
     return null;
@@ -3058,7 +3588,7 @@ private hslToHex(h: number, s: number, l: number): string {
     if (!p) return;
     const { ctx } = this;
     const g = this.producerMenuGeom();
-    const panelH = g.header + 3 * (g.rowH + 8) + g.pad;
+    const panelH = g.header + 4 * (g.rowH + 8) + g.pad;
     ctx.fillStyle = 'rgba(30, 30, 30, 0.92)';
     ctx.fillRect(g.x, g.y, g.w, panelH);
     ctx.strokeStyle = 'rgba(255, 215, 0, 0.55)';
@@ -3079,8 +3609,9 @@ private hslToHex(h: number, s: number, l: number): string {
       [`Respawn Speed  Lv ${p.speedLv}`, `${respawn.toFixed(2)}s between respawns`, this.producerSpeedCost(p)],
       [`Dropper Count  Lv ${p.countLv}`, `${1 + p.countLv} droppers active`, this.producerCountCost(p)],
       [`Trail  Lv ${p.trailLv}`, `Lv2+ leaves a line behind droppers`, trailMaxed ? 0 : this.producerTrailCost(p)],
+      [`Color  Lv ${p.colorLv}`, `droppers get random colors`, this.producerColorCost(p)],
     ];
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 4; i++) {
       const ry = rowsTop + i * (g.rowH + 8);
       ctx.fillStyle = 'rgba(255, 255, 255, 0.05)';
       ctx.fillRect(g.x + g.pad, ry, g.w - g.pad * 2, g.rowH);
@@ -3227,6 +3758,127 @@ private hslToHex(h: number, s: number, l: number): string {
     }
   }
 
+  private renderWorldBanks(): void {
+    const { ctx } = this;
+    const mx = this.mouseX / this.zoom + this.camX;
+    const my = this.mouseY / this.zoom + this.camY;
+    this.hoveredBankIndex = this.hitBankPoint(mx, my);
+    for (let i = 0; i < this.banks.length; i++) {
+      const b = this.banks[i];
+      this.drawBankShape(b.x, b.y, 1);
+      if (b.money > 0) {
+        ctx.fillStyle = '#ffd700';
+        ctx.font = '11px system-ui, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(`$${b.money}`, b.x + this.bankW / 2, b.y - 4);
+      }
+      if (i === this.hoveredBankIndex || this.selectedBank === b) {
+        this.drawBankHighlight(b.x, b.y, this.selectedBank === b);
+      }
+    }
+    if (this.objectMode !== 'bank' || this.erasing) return;
+    const pos = this.clampBankPos(
+      (this.bankDrag ? this.bankDrag.x : mx) - this.bankW / 2,
+      (this.bankDrag ? this.bankDrag.y : my) - this.bankH / 2,
+    );
+    this.drawBankShape(pos.x, pos.y, this.bankDrag ? 0.85 : 0.5, this.freePlace || this.money >= this.bankCost);
+  }
+
+  private drawBankHighlight(x: number, y: number, selected = false): void {
+    const { ctx } = this;
+    ctx.strokeStyle = selected ? 'rgba(255, 215, 0, 0.95)' : 'rgba(255, 255, 255, 0.9)';
+    ctx.lineWidth = 3;
+    ctx.setLineDash([5, 3]);
+    ctx.strokeRect(x - 2, y - 2, this.bankW + 4, this.bankH + 4);
+    ctx.setLineDash([]);
+  }
+
+  private drawBankShape(x: number, y: number, alpha: number, affordable = true): void {
+    const { ctx } = this;
+    const w = this.bankW;
+    const h = this.bankH;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = affordable ? '#3b3b3b' : 'rgba(180, 60, 60, 0.85)';
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = 'rgba(255, 215, 0, 0.7)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x, y, w, h);
+    ctx.fillStyle = 'rgba(255, 215, 0, 0.9)';
+    ctx.fillRect(x + w / 2 - 8, y + 7, 16, 4);
+    ctx.beginPath();
+    ctx.arc(x + w / 2, y + h / 2 + 3, 8, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#3b3b3b';
+    ctx.font = 'bold 10px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('$', x + w / 2, y + h / 2 + 6);
+    ctx.restore();
+  }
+
+  private renderBankMenu(): void {
+    const b = this.selectedBank;
+    if (!b) return;
+    const { ctx } = this;
+    const g = this.bankMenuGeom();
+    const panelH = g.header + g.btnH + 8 + 3 * (g.rowH + 8) + g.pad;
+    ctx.fillStyle = 'rgba(30, 30, 30, 0.92)';
+    ctx.fillRect(g.x, g.y, g.w, panelH);
+    ctx.strokeStyle = 'rgba(255, 215, 0, 0.55)';
+    ctx.strokeRect(g.x, g.y, g.w, panelH);
+    ctx.font = '13px system-ui, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#ffd700';
+    ctx.fillText('BLOOD BANK', g.x + g.pad, g.y + g.pad + 10);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+    ctx.textAlign = 'right';
+    ctx.fillText('x', g.x + g.w - g.pad - 9, g.y + g.pad + 10);
+    ctx.textAlign = 'left';
+
+    const btnY = g.y + g.header + 4;
+    const cashable = b.money > 0;
+    ctx.fillStyle = cashable ? 'rgba(255, 215, 0, 0.85)' : 'rgba(90, 90, 90, 0.85)';
+    ctx.fillRect(g.x + g.pad, btnY, g.w - g.pad * 2, g.btnH);
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+    ctx.strokeRect(g.x + g.pad, btnY, g.w - g.pad * 2, g.btnH);
+    ctx.fillStyle = cashable ? '#111111' : 'rgba(255, 255, 255, 0.85)';
+    ctx.font = '12px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(`Cash Out $${b.money}`, g.x + g.w / 2, btnY + g.btnH / 2 + 4);
+    ctx.textAlign = 'left';
+
+    const rowsTop = g.y + g.header + g.btnH + 8;
+    const cap = this.bankCapacity(b);
+    const rows: ReadonlyArray<readonly [string, string, number]> = [
+      [`Value  Lv ${b.valueLv}`, `+$2 per splat (now $${this.bankValuePerSplat(b)})`, this.bankValueCost(b)],
+      [`Capacity  Lv ${b.capLv}`, `holds up to $${cap}`, this.bankCapCost(b)],
+      [`Auto-Cash  Lv ${b.autoLv}`, `25% of bank cashes every 5s`, this.bankAutoCost(b)],
+    ];
+    for (let i = 0; i < 3; i++) {
+      const ry = rowsTop + i * (g.rowH + 8);
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.05)';
+      ctx.fillRect(g.x + g.pad, ry, g.w - g.pad * 2, g.rowH);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '13px system-ui, sans-serif';
+      ctx.fillText(rows[i][0], g.x + g.pad + 8, ry + 16);
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.65)';
+      ctx.font = '11px system-ui, sans-serif';
+      ctx.fillText(rows[i][1], g.x + g.pad + 8, ry + 31);
+      const bx = g.x + g.w - g.pad - 120;
+      const by = ry + (g.rowH - 26) / 2;
+      const afford = this.money >= rows[i][2];
+      ctx.fillStyle = afford ? 'rgba(255, 215, 0, 0.85)' : 'rgba(120, 90, 20, 0.85)';
+      ctx.fillRect(bx, by, 120, 26);
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+      ctx.strokeRect(bx, by, 120, 26);
+      ctx.fillStyle = afford ? '#111111' : 'rgba(255, 255, 255, 0.85)';
+      ctx.font = '12px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(`$${rows[i][2]}`, bx + 60, by + 17);
+      ctx.textAlign = 'left';
+    }
+  }
+
   private drawFanHighlight(x: number, y: number, selected = false): void {
     const { ctx } = this;
     const s = this.fanSize;
@@ -3284,8 +3936,17 @@ private hslToHex(h: number, s: number, l: number): string {
     this.shake = Math.max(0, this.shake - dt * 40);
     this.bounceSoundTimer = Math.max(0, this.bounceSoundTimer - dt);
     this.borderSoundTimer = Math.max(0, this.borderSoundTimer - dt);
-    if (this.dragged !== this.bouncer) {
-      this.updateBouncer(dt);
+    this.bankAutoTimer -= dt;
+    if (this.bankAutoTimer <= 0) {
+      this.bankAutoTimer = 5;
+      for (const b of this.banks) {
+        if (b.autoLv > 0 && b.money > 0) {
+          const take = Math.ceil(b.money * 0.25);
+          this.money += take;
+          b.money -= take;
+          this.markSaveDirty();
+        }
+      }
     }
     for (const d of this.droppers) {
       if (d.alive) {
@@ -3306,7 +3967,6 @@ private hslToHex(h: number, s: number, l: number): string {
     this.checkStuckDroppers(dt);
     this.respawnDropper(dt);
     this.updateParticles(dt);
-    this.updateSplats(dt);
     for (let i = this.rings.length - 1; i >= 0; i--) {
       if (this.time - this.rings[i].born >= this.rings[i].life) {
         this.rings.splice(i, 1);
@@ -3314,12 +3974,26 @@ private hslToHex(h: number, s: number, l: number): string {
     }
     const life = this.splatLifetime();
     for (let i = this.splats.length - 1; i >= 0; i--) {
-      if (this.time - this.splats[i].born >= life + 0.5) {
+      const s = this.splats[i];
+      if (s.fadeStart !== undefined) {
+        if (this.time - s.fadeStart >= 1) {
+          this.splats.splice(i, 1);
+        }
+        continue;
+      }
+      if (this.time - s.born >= life + 0.5) {
         this.splats.splice(i, 1);
       }
     }
-    if (this.splats.length > 400) {
-      this.splats.splice(0, this.splats.length - 400);
+    const maxSplats = 400;
+    if (this.splats.length > maxSplats) {
+      const excess = this.splats.length - maxSplats;
+      for (let i = 0; i < excess; i++) {
+        const s = this.splats[i];
+        if (s.fadeStart === undefined) {
+          s.fadeStart = this.time;
+        }
+      }
     }
   }
 
@@ -3352,20 +4026,6 @@ private hslToHex(h: number, s: number, l: number): string {
     }
 
     ctx.drawImage(this.layer, 0, 0);
-
-    const life = this.splatLifetime();
-    for (let i = this.worldStains.length - 1; i >= 0; i--) {
-      const ws = this.worldStains[i];
-      const age = this.time - ws.born;
-      if (age >= life) {
-        this.worldStains.splice(i, 1);
-        continue;
-      }
-      ctx.globalAlpha = ws.alpha * (1 - age / life);
-      ctx.fillStyle = ws.color;
-      ctx.fillRect(ws.x - ws.size / 2, ws.y - ws.size / 2, ws.size, ws.size);
-    }
-    ctx.globalAlpha = 1;
 
     this.renderSplats();
 
@@ -3403,6 +4063,7 @@ private hslToHex(h: number, s: number, l: number): string {
     this.renderWorldProducers();
     this.renderWorldFans();
     this.renderWorldExtraBouncers();
+    this.renderWorldBanks();
     ctx.restore();
 
     this.renderUpgrades();
@@ -3410,6 +4071,7 @@ private hslToHex(h: number, s: number, l: number): string {
     this.renderObjectsMenu();
     this.renderProducerMenu();
     this.renderFanMenu();
+    this.renderBankMenu();
     this.renderSecretMenu();
 
     const bh = 30;
@@ -3418,7 +4080,11 @@ private hslToHex(h: number, s: number, l: number): string {
     ctx.fillStyle = '#ffffff';
     ctx.font = '13px system-ui, sans-serif';
     ctx.textAlign = 'left';
-    ctx.fillText(`money: $${this.money}   producers: ${this.producers.length}`, bx, by + bh / 2 + 4.5);
+    let hud = `money: $${this.money}   producers: ${this.producers.length}`;
+    if (this.prestigeLevel > 0) {
+      hud += `   prestige: Lv ${this.prestigeLevel} x${this.prestigeMultiplier()}`;
+    }
+    ctx.fillText(hud, bx, by + bh / 2 + 4.5);
 
     if (this.erasing) {
       const r = (this.eraserWidth * this.deviceScale * this.zoom) / 2;
